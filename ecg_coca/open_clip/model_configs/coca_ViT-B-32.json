@@ -1,0 +1,26 @@
+{
+    "embed_dim": 512,
+    "ecg_cfg": {
+        "layers": 12,
+        "width": 768,
+        "head_width": 64,
+        "mlp_ratio": 4,
+        "patch_size": 50,
+        "seq_length": 5000,
+        "lead_num": 12
+    },
+    "text_cfg": {
+        "context_length": 77,
+        "vocab_size": 49408,
+        "width": 512,
+        "heads": 8,
+        "layers": 12
+    },
+    "multimodal_cfg": {
+        "context_length": 77,
+        "vocab_size": 49408,
+        "width": 512,
+        "heads": 8,
+        "layers": 12
+    }
+}

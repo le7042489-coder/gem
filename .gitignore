@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Python env / tooling caches
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Node / Next.js (this repo has `frontend/`)
+node_modules/
+.next/
+.turbo/
+.vercel/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Logs
+*.log
+*.log.*
+
+# Data (keep large/derived data out of git)
+data/
+datasets/
+temp_upload/
+output/
+wandb/
+serve_images/
+!**/alpaca-data-conversation.json
+
+# Model weights / checkpoints / binary artifacts
+checkpoints/
+ckpts*/
+ecg_coca/open_clip/checkpoint/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.onnx
+*.gguf
+*.whl
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env files (commit `.env.example`, never commit real secrets)
+.env
+.env.*
+!.env.example
+
+# DevContainer (explicitly keep tracked)
+!.devcontainer/*

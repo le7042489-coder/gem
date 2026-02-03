@@ -1,0 +1,1 @@
+"""GEM FastAPI backend package."""
