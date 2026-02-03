@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import List, Tuple, Optional
 
 import numpy as np
+import scipy.signal
 import wfdb
 from fastapi import UploadFile
 
@@ -45,10 +46,9 @@ def process_uploaded_files(files: List[UploadFile]) -> Tuple[Optional[np.ndarray
                 signal = signal[:, indices]
 
         if fs != TARGET_FS:
-            step = fs / TARGET_FS
-            indices = np.arange(0, signal.shape[0], step).astype(int)
-            indices = indices[indices < signal.shape[0]]
-            signal = signal[indices]
+            num_samples = int(round(signal.shape[0] * TARGET_FS / fs))
+            num_samples = max(1, num_samples)
+            signal = scipy.signal.resample(signal, num_samples, axis=0)
 
         if signal.shape[0] < TARGET_LEN:
             pad_len = TARGET_LEN - signal.shape[0]

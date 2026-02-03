@@ -7,7 +7,7 @@ from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
 from llava.mm_utils import get_model_name_from_path
 
-from ..config import MODEL_PATH, MODEL_BASE
+from ..config import MODEL_PATH, MODEL_BASE, DEVICE_MAP
 
 
 class ModelManager:
@@ -33,7 +33,7 @@ class ModelManager:
             model_base,
             model_name,
             quantization_config=bnb_config,
-            device_map={"": 0}
+            device_map=DEVICE_MAP
         )
 
     @classmethod

@@ -14,8 +14,12 @@ export default function LandingPage() {
 
   const handleFiles = (fileList: FileList | null) => {
     if (!fileList) return;
-    const list = Array.from(fileList);
+    const list = Array.from(fileList).filter((file) => {
+      const name = file.name.toLowerCase();
+      return name.endsWith(".dat") || name.endsWith(".hea");
+    });
     setFiles(list);
+    setError(null);
   };
 
   const handleDrop = (event: DragEvent<HTMLDivElement>) => {
@@ -27,6 +31,12 @@ export default function LandingPage() {
     setError(null);
     if (files.length === 0) {
       setError("Please upload .dat and .hea files.");
+      return;
+    }
+    const hasDat = files.some((file) => file.name.toLowerCase().endsWith(".dat"));
+    const hasHea = files.some((file) => file.name.toLowerCase().endsWith(".hea"));
+    if (!hasDat || !hasHea) {
+      setError("Both .dat and .hea files are required.");
       return;
     }
     setLoading(true);
@@ -82,6 +92,12 @@ export default function LandingPage() {
             Load Demo Data
           </button>
         </div>
+        {loading && (
+          <div className="loading-row" aria-live="polite">
+            <span className="spinner" aria-hidden="true" />
+            <span className="muted">Model is running. This can take a few seconds…</span>
+          </div>
+        )}
 
         {files.length > 0 && (
           <div style={{ marginTop: 16 }}>

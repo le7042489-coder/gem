@@ -14,9 +14,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 import textwrap
 import tempfile
+import scipy.signal
 
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from backend.app.config import MODEL_PATH, MODEL_BASE, DEVICE_MAP
+from backend.app.config import TARGET_FS, TARGET_LEN
 from llava.conversation import conv_templates, SeparatorStyle
 from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
@@ -436,7 +438,7 @@ def export_report_pdf(report_text):
 
 # ==================== 3. 信号处理与绘图核心 (核心复现逻辑) ====================
 
-def process_uploaded_files(files):
+def process_uploaded_files(files, window_start_s=0.0):
     """
     处理上传的文件列表，寻找成对的 .dat 和 .hea
     返回: signal (12, 5000), sampling_rate, temp_base_path
@@ -470,6 +472,8 @@ def process_uploaded_files(files):
         signal = record[0]  # (Samples, Channels)
         meta = record[1]
         fs = meta['fs']
+        if not fs or fs <= 0:
+            return None, None, "❌ 采样率无效，请检查 .hea 文件"
 
         # 尝试按标准 12 导联顺序重排
         sig_names = meta.get('sig_name', None)
@@ -481,23 +485,28 @@ def process_uploaded_files(files):
 
         # 简单的重采样逻辑：GEM 需要 500Hz
         # 如果是 MIMIC-IV (通常 500Hz)，则直接用
-        target_fs = 500
+        target_fs = TARGET_FS
         if fs != target_fs:
-            # 简单重采样: 每隔 n 个点取一个 (降采样)
-            step = fs / target_fs
-            indices = np.arange(0, signal.shape[0], step).astype(int)
-            indices = indices[indices < signal.shape[0]]
-            signal = signal[indices]
+            num_samples = int(round(signal.shape[0] * target_fs / fs))
+            num_samples = max(1, num_samples)
+            signal = scipy.signal.resample(signal, num_samples, axis=0)
 
         # 调整长度到 10秒 (5000点)
-        target_len = 5000
+        target_len = TARGET_LEN
         if signal.shape[0] < target_len:
             # 填充
             pad_len = target_len - signal.shape[0]
             signal = np.pad(signal, ((0, pad_len), (0, 0)))
         else:
-            # 截断
-            signal = signal[:target_len, :]
+            # 智能切片：支持用户指定时间窗口起点
+            try:
+                window_start_s = float(window_start_s or 0.0)
+            except (TypeError, ValueError):
+                window_start_s = 0.0
+            start_idx = int(round(window_start_s * target_fs))
+            max_start = max(0, signal.shape[0] - target_len)
+            start_idx = max(0, min(start_idx, max_start))
+            signal = signal[start_idx:start_idx + target_len, :]
 
         # 转置为 (Channels, Samples) -> (12, 5000)
         signal = signal.T
@@ -683,9 +692,9 @@ def plot_single_lead(signal_data, lead_name, findings=None, fs=500):
 
 # ==================== 5. 主推理逻辑 ====================
 
-def run_inference(files, text_query, mode, return_state=False):
+def run_inference(files, text_query, mode, window_start_s=0.0, return_state=False):
     # 1. 处理输入文件
-    signal_np, fs, msg = process_uploaded_files(files)
+    signal_np, fs, msg = process_uploaded_files(files, window_start_s=window_start_s)
     if signal_np is None:
         if return_state:
             return None, f"❌ {msg}", [], None, None
@@ -817,8 +826,8 @@ def run_inference(files, text_query, mode, return_state=False):
     return ecg_image, report_text
 
 
-def run_diagnosis(files):
-    return run_inference(files, DEFAULT_DIAG_PROMPT, "diagnosis", return_state=True)
+def run_diagnosis(files, window_start_s=0.0):
+    return run_inference(files, DEFAULT_DIAG_PROMPT, "diagnosis", window_start_s=window_start_s, return_state=True)
 
 
 def update_lead_view(lead_name, signal_state, findings_state, fs_state):
@@ -828,7 +837,7 @@ def update_lead_view(lead_name, signal_state, findings_state, fs_state):
     return plot_single_lead(signal_state, lead_name, findings_state, fs=fs)
 
 
-def start_analysis(files):
+def start_analysis(files, window_start_s):
     if not files:
         return (
             gr.update(visible=True),
@@ -841,7 +850,7 @@ def start_analysis(files):
             "❌ 请先上传 .dat 和 .hea 文件。"
         )
 
-    ecg_image, report_text, findings, _, _ = run_diagnosis(files)
+    ecg_image, report_text, findings, _, _ = run_diagnosis(files, window_start_s=window_start_s)
     if ecg_image is None or report_text.startswith("❌") or report_text.startswith("Error"):
         return (
             gr.update(visible=True),
@@ -880,7 +889,8 @@ def reset_to_landing():
         [],
         None,
         "",
-        None
+        None,
+        0.0
     )
 
 
@@ -1005,6 +1015,14 @@ with gr.Blocks(title="GEM Clinical ECG Workbench", css=CLINIC_CSS) as demo:
                 file_types=[".dat", ".hea"],
                 elem_id="landing-drop"
             )
+            window_start_slider = gr.Slider(
+                label="时间窗口起点 (秒)",
+                minimum=0,
+                maximum=60,
+                value=0,
+                step=0.5,
+                info="仅当记录长于 10 秒时生效，会自动裁剪到有效范围。"
+            )
             start_btn = gr.Button("Start AI Analysis", elem_id="landing-cta")
             landing_status = gr.Markdown("", elem_id="landing-status")
 
@@ -1037,14 +1055,14 @@ with gr.Blocks(title="GEM Clinical ECG Workbench", css=CLINIC_CSS) as demo:
 
     start_btn.click(
         fn=start_analysis,
-        inputs=[file_input],
+        inputs=[file_input, window_start_slider],
         outputs=[landing_group, workbench_group, ecg_plot, findings_table, report_box, findings_state, image_state, landing_status]
     )
 
     new_btn.click(
         fn=reset_to_landing,
         inputs=[],
-        outputs=[landing_group, workbench_group, ecg_plot, findings_table, report_box, findings_state, image_state, landing_status, file_input]
+        outputs=[landing_group, workbench_group, ecg_plot, findings_table, report_box, findings_state, image_state, landing_status, file_input, window_start_slider]
     )
 
     reset_btn.click(

@@ -54,13 +54,14 @@ def _build_prompt(text_query: str, mode: str) -> str:
 def run_inference(signal_np: np.ndarray, text_query: str = DEFAULT_DIAG_PROMPT, mode: str = "diagnosis") -> Dict[str, Any]:
     manager = ModelManager.get()
 
+    sig_mean = signal_np.mean()
+    sig_std = signal_np.std()
+    if sig_std > 1e-6:
+        signal_np = (signal_np - sig_mean) / sig_std
+
     ecg_image = plot_ecg_3x4_grid(signal_np)
 
     sig_tensor = torch.from_numpy(signal_np).float()
-    sig_mean = sig_tensor.mean()
-    sig_std = sig_tensor.std()
-    if sig_std > 1e-6:
-        sig_tensor = (sig_tensor - sig_mean) / sig_std
     ecgs_tensor = sig_tensor.unsqueeze(0).half().cuda()
 
     if hasattr(manager.image_processor, "preprocess"):
