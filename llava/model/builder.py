@@ -1,4 +1,3 @@
-from transformers import BitsAndBytesConfig
 #    Copyright 2023 Haotian Liu
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,13 +23,36 @@ from llava.model import *
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 
-def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", use_flash_attn=False, **kwargs):
+REQUIRED_SKIP_MODULES = ("ecg_tower", "vision_tower", "mm_projector")
+
+
+def _ensure_skip_modules(quant_config):
+    if not hasattr(quant_config, "llm_int8_skip_modules"):
+        return
+    current = getattr(quant_config, "llm_int8_skip_modules")
+    if current is None:
+        current = []
+    merged = list(dict.fromkeys(list(current) + list(REQUIRED_SKIP_MODULES)))
+    quant_config.llm_int8_skip_modules = merged
+
+
+def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", use_flash_attn=False, quantization_config=None, **kwargs):
     kwargs = {"device_map": device_map, **kwargs}
 
     if device != "cuda":
         kwargs['device_map'] = {"": device}
 
-    if load_8bit:
+    if quantization_config is not None:
+        if isinstance(quantization_config, dict):
+            quantization_config = BitsAndBytesConfig(**quantization_config)
+        _ensure_skip_modules(quantization_config)
+        kwargs['quantization_config'] = quantization_config
+        if load_8bit or load_4bit:
+            warnings.warn(
+                "quantization_config provided; load_8bit/load_4bit flags are ignored.",
+                stacklevel=2,
+            )
+    elif load_8bit:
         kwargs['load_in_8bit'] = True
     elif load_4bit:
         kwargs['quantization_config'] = BitsAndBytesConfig(
@@ -38,7 +60,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type='nf4',
-	    llm_int8_skip_modules=["ecg_tower", "vision_tower", "mm_projector"]
+            llm_int8_skip_modules=list(REQUIRED_SKIP_MODULES),
         )
     else:
         kwargs['torch_dtype'] = torch.float16

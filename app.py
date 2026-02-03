@@ -16,6 +16,7 @@ import textwrap
 import tempfile
 
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from backend.app.config import MODEL_PATH, MODEL_BASE, DEVICE_MAP
 from llava.conversation import conv_templates, SeparatorStyle
 from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
@@ -25,9 +26,7 @@ from llava.mm_utils import tokenizer_image_token, get_model_name_from_path, Keyw
 print("⏳ 正在初始化 GEM 模型 (4-bit)...")
 disable_torch_init()
 
-model_path = "checkpoints/GEM-7B"  # 请根据实际路径修改
-model_name = get_model_name_from_path(model_path)
-model_base = None
+model_name = get_model_name_from_path(MODEL_PATH)
 
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
@@ -39,11 +38,11 @@ bnb_config = BitsAndBytesConfig(
 
 # 强制 device_map 使用 GPU 0，防止加速库将部分层切分到 CPU 导致报错
 tokenizer, model, image_processor, context_len = load_pretrained_model(
-    model_path,
-    model_base,
+    MODEL_PATH,
+    MODEL_BASE,
     model_name,
     quantization_config=bnb_config,
-    device_map={"": 0}
+    device_map=DEVICE_MAP,
 )
 
 print("✅ 模型加载完成！")
