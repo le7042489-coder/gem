@@ -68,6 +68,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
+        labels_segmentation: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -87,7 +88,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 attention_mask, 
                 past_key_values, 
                 inputs_embeds, 
-                labels
+                labels,
+                _ecg_token_mask,
             ) = self.prepare_inputs_labels_for_multimodal(
                 input_ids, 
                 position_ids, 
@@ -154,7 +156,8 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 attention_mask, 
                 _, 
                 inputs_embeds, 
-                _
+                _,
+                _ecg_token_mask,
             ) = self.prepare_inputs_labels_for_multimodal(
                 inputs, 
                 position_ids, 

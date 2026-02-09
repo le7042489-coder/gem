@@ -118,6 +118,10 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_dropout: float = 0.05
     lora_weight_path: str = ""
     lora_bias: str = "none"
+    modules_to_save: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "Extra (non-LoRA) modules to keep trainable and save with the adapter."},
+    )
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
     attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
@@ -139,10 +143,13 @@ def maybe_zero_3(param, ignore_status=False, name=None):
 
 # Borrowed from peft.utils.get_peft_model_state_dict
 def get_peft_state_maybe_zero_3(named_params, bias):
+    def _is_modules_to_save_key(k: str) -> bool:
+        return "modules_to_save" in k
+
     if bias == "none":
-        to_return = {k: t for k, t in named_params if "lora_" in k}
+        to_return = {k: t for k, t in named_params if "lora_" in k or _is_modules_to_save_key(k)}
     elif bias == "all":
-        to_return = {k: t for k, t in named_params if "lora_" in k or "bias" in k}
+        to_return = {k: t for k, t in named_params if "lora_" in k or "bias" in k or _is_modules_to_save_key(k)}
     elif bias == "lora_only":
         to_return = {}
         maybe_lora_bias = {}
@@ -150,15 +157,17 @@ def get_peft_state_maybe_zero_3(named_params, bias):
         for k, t in named_params:
             if "lora_" in k:
                 to_return[k] = t
-                bias_name = k.split("lora_")[0] + "bias"
-                lora_bias_names.add(bias_name)
+                lora_bias_names.add(k.split("lora_")[0] + "bias")
             elif "bias" in k:
                 maybe_lora_bias[k] = t
-        for k, t in maybe_lora_bias:
-            if bias_name in lora_bias_names:
-                to_return[bias_name] = t
+            elif _is_modules_to_save_key(k):
+                to_return[k] = t
+        for k, t in maybe_lora_bias.items():
+            if k in lora_bias_names:
+                to_return[k] = t
     else:
         raise NotImplementedError
+
     to_return = {k: maybe_zero_3(v, ignore_status=True) for k, v in to_return.items()}
     return to_return
 
@@ -180,7 +189,7 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
-    multimodal_keywords = ['mm_projector', 'ecg_projector', 'ecg_tower', 'ecg_resampler', 'vision_tower', 'vision_resampler']
+    multimodal_keywords = ['mm_projector', 'ecg_projector', 'ecg_tower', 'ecg_resampler', 'vision_tower', 'vision_resampler', 'seg_head']
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
@@ -761,6 +770,7 @@ class LazySupervisedDataset(Dataset):
         self.list_data_dict = list_data_dict
         self.data_args = data_args
         self.model_config = model_config
+        self.data_path = data_path
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -787,25 +797,72 @@ class LazySupervisedDataset(Dataset):
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
-        if 'image' in sources[0]:
-            #! read ecg files
-            ecg_file = self.list_data_dict[i]['ecg']
-            ecg_folder = self.data_args.ecg_folder
-            ecg = wfdb.rdsamp(os.path.join(ecg_folder, ecg_file))[0]
-            ecg[np.isnan(ecg)] = 0
-            ecg[np.isinf(ecg)] = 0
-            ecg = torch.Tensor(np.transpose(ecg, (1, 0)).astype(np.float32))
-            c, length = ecg.shape
-            seq_length = self.data_args.ecg_seq_length
-            if length < seq_length:
-                new_ecg = torch.zeros((c, seq_length))
-                new_ecg[:, 0:length] = ecg
-                ecg = new_ecg
-            elif length > seq_length:
-                ecg = ecg[:, 0:seq_length]     
+        sample = sources[0]
+        if 'image' in sample:
+            #! read ecg files (new: `time_series` .npy, fallback: wfdb `ecg`)
+            time_series = sample.get("time_series", None)
+            has_time_series = (
+                time_series is not None
+                and str(time_series).strip() != ""
+                and str(time_series).strip().lower() != "none"
+            )
+            if has_time_series:
+                time_series = str(time_series)
+                if os.path.isabs(time_series):
+                    signal_path = time_series
+                else:
+                    signal_path = os.path.join(self.data_args.image_folder, time_series)
+
+                signal = np.load(signal_path)
+                signal = np.asarray(signal).astype(np.float32)
+                if signal.ndim != 2:
+                    raise ValueError(f"`time_series` must be a 2D array. Got shape={signal.shape} from {signal_path!r}")
+                if signal.shape[0] == 12:
+                    pass
+                elif signal.shape[1] == 12:
+                    signal = np.transpose(signal, (1, 0))
+                else:
+                    raise ValueError(f"`time_series` must be shaped (12, L) or (L, 12). Got shape={signal.shape} from {signal_path!r}")
+
+                signal[np.isnan(signal)] = 0
+                signal[np.isinf(signal)] = 0
+                c, length = signal.shape
+                seq_length = self.data_args.ecg_seq_length
+                if length < seq_length:
+                    new_ecg = np.zeros((c, seq_length), dtype=np.float32)
+                    new_ecg[:, 0:length] = signal
+                    signal = new_ecg
+                elif length > seq_length:
+                    signal = signal[:, 0:seq_length]
+
+                ecg = torch.from_numpy(signal)
+            else:
+                ecg_file = sample.get("ecg", None)
+                has_ecg = (
+                    ecg_file is not None
+                    and str(ecg_file).strip() != ""
+                    and str(ecg_file).strip().lower() != "none"
+                )
+                if not has_ecg:
+                    raise KeyError("Sample is missing both `time_series` and `ecg` for ECG loading.")
+
+                ecg_file = str(ecg_file)
+                ecg_folder = self.data_args.ecg_folder
+                ecg = wfdb.rdsamp(os.path.join(ecg_folder, ecg_file))[0]
+                ecg[np.isnan(ecg)] = 0
+                ecg[np.isinf(ecg)] = 0
+                ecg = torch.Tensor(np.transpose(ecg, (1, 0)).astype(np.float32))
+                c, length = ecg.shape
+                seq_length = self.data_args.ecg_seq_length
+                if length < seq_length:
+                    new_ecg = torch.zeros((c, seq_length))
+                    new_ecg[:, 0:length] = ecg
+                    ecg = new_ecg
+                elif length > seq_length:
+                    ecg = ecg[:, 0:seq_length]     
 
             #! read image files
-            image_file = self.list_data_dict[i]['image']
+            image_file = sample['image']
             image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
             image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
@@ -839,13 +896,13 @@ class LazySupervisedDataset(Dataset):
         data_dict = preprocess(
             sources,
             self.tokenizer,
-            has_image=('image' in self.list_data_dict[i]))
+            has_image=('image' in sample))
         if isinstance(i, int):
             data_dict = dict(input_ids=data_dict["input_ids"][0],
                              labels=data_dict["labels"][0])
 
         # image exist in the data
-        if 'image' in self.list_data_dict[i]:
+        if 'image' in sample:
             data_dict['ecg'] = ecg
             data_dict['image'] = image
             data_dict['image_size'] = image_size
@@ -854,6 +911,34 @@ class LazySupervisedDataset(Dataset):
             # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size
             data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+
+        mask_path = sample.get("mask_path", None)
+        has_mask = (
+            mask_path is not None
+            and str(mask_path).strip() != ""
+            and str(mask_path).strip().lower() != "none"
+        )
+        if has_mask:
+            mask_path = str(mask_path)
+            if os.path.isabs(mask_path):
+                mask_full_path = mask_path
+            else:
+                mask_full_path = os.path.join(self.data_args.image_folder, mask_path)
+            if not os.path.exists(mask_full_path):
+                raise FileNotFoundError(f"Segmentation mask file not found for mask_path={mask_path!r}")
+
+            mask_np = np.load(mask_full_path)
+            mask_np = np.asarray(mask_np).squeeze().reshape(-1).astype(np.int64, copy=False)
+            target_len = 5000
+            aligned = np.full((target_len,), -1, dtype=np.int64)
+            copy_len = min(mask_np.shape[0], target_len)
+            aligned[:copy_len] = mask_np[:copy_len]
+            labels_segmentation = torch.from_numpy(aligned).long()
+        else:
+            labels_segmentation = torch.full((5000,), -1, dtype=torch.long)
+
+        data_dict["labels_segmentation"] = labels_segmentation
+
         return data_dict
 
 
@@ -888,6 +973,11 @@ class DataCollatorForSupervisedDataset(object):
             labels=labels,
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
+
+        if "labels_segmentation" in instances[0]:
+            labels_seg_list = [instance["labels_segmentation"] for instance in instances]
+            batch["labels_segmentation"] = torch.stack(labels_seg_list).long()
+            assert batch["labels_segmentation"].shape[1] == 5000
 
         if 'ecg' in instances[0]:
             ecgs = [instance['ecg'] for instance in instances]
@@ -1021,7 +1111,7 @@ def train(attn_implementation=None):
 
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
-        lora_config = LoraConfig(
+        lora_config_kwargs = dict(
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
             target_modules=find_all_linear_names(model),
@@ -1029,6 +1119,16 @@ def train(attn_implementation=None):
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
         )
+        if training_args.modules_to_save:
+            lora_config_kwargs["modules_to_save"] = training_args.modules_to_save
+        try:
+            lora_config = LoraConfig(**lora_config_kwargs)
+        except TypeError as e:
+            if "modules_to_save" in str(e):
+                lora_config_kwargs.pop("modules_to_save", None)
+                lora_config = LoraConfig(**lora_config_kwargs)
+            else:
+                raise
         if training_args.bits == 16:
             if training_args.bf16:
                 model.to(torch.bfloat16)
@@ -1036,6 +1136,14 @@ def train(attn_implementation=None):
                 model.to(torch.float16)
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
+        if training_args.modules_to_save:
+            has_modules_to_save_wrapper = any("modules_to_save" in n for n, _ in model.named_parameters())
+            if not has_modules_to_save_wrapper:
+                module_names_to_unfreeze = set(training_args.modules_to_save)
+                for module_name, module in model.named_modules():
+                    if module_name.split(".")[-1] in module_names_to_unfreeze:
+                        for p in module.parameters():
+                            p.requires_grad = True
 
     if 'mpt' in model_args.model_name_or_path:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -1101,7 +1209,8 @@ def train(attn_implementation=None):
 
         model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
         if model_args.tune_mm_mlp_adapter:
-            model.requires_grad_(False)
+            if not training_args.lora_enable:
+                model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = True
             for p in model.get_model().ecg_projector.parameters():
@@ -1124,6 +1233,11 @@ def train(attn_implementation=None):
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+
+    if hasattr(model, "get_model") and hasattr(model.get_model(), "seg_head"):
+        model.get_model().seg_head.to(dtype=compute_dtype, device=training_args.device)
+        for p in model.get_model().seg_head.parameters():
+            p.requires_grad = True
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer

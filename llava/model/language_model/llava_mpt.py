@@ -13,7 +13,7 @@
 #    limitations under the License.
 
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -60,20 +60,43 @@ class LlavaMptForCausalLM(MptForCausalLM, LlavaMetaForCausalLM):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
+        labels_segmentation: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        images=None):
+        ecgs: Optional[torch.FloatTensor] = None,
+        images: Optional[torch.FloatTensor] = None,
+        image_sizes: Optional[List[List[int]]] = None,
+    ):
 
-        input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(input_ids, attention_mask, past_key_values, labels, images)
+        if inputs_embeds is None:
+            (
+                input_ids,
+                position_ids,
+                attention_mask,
+                past_key_values,
+                inputs_embeds,
+                labels,
+                _ecg_token_mask,
+            ) = self.prepare_inputs_labels_for_multimodal(
+                input_ids,
+                position_ids,
+                attention_mask,
+                past_key_values,
+                labels,
+                ecgs,
+                images,
+                image_sizes,
+            )
         
         return super().forward(
-            input_ids,
+            input_ids=input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
@@ -85,11 +108,17 @@ class LlavaMptForCausalLM(MptForCausalLM, LlavaMetaForCausalLM):
         )
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
+        ecgs = kwargs.pop("ecgs", None)
         images = kwargs.pop("images", None)
+        image_sizes = kwargs.pop("image_sizes", None)
         _inputs = super().prepare_inputs_for_generation(
             input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs
         )
+        if ecgs is not None:
+            _inputs['ecgs'] = ecgs
         _inputs['images'] = images
+        if image_sizes is not None:
+            _inputs['image_sizes'] = image_sizes
         return _inputs
 
 

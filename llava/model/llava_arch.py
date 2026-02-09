@@ -17,6 +17,7 @@ from abc import ABC, abstractmethod
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .multimodal_encoder.builder import build_ecg_tower
 from .multimodal_projector.builder import build_ecg_projector
@@ -27,6 +28,28 @@ from .multimodal_projector.builder import build_vision_projector
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 from llava.mm_utils import get_anyres_image_grid_shape
+
+
+class SegmentationHead(nn.Module):
+    """Project ECG token hidden states to per-sample segmentation logits."""
+
+    def __init__(self, hidden_size: int, num_classes: int = 4, target_length: int = 5000):
+        super().__init__()
+        self.num_classes = num_classes
+        self.target_length = target_length
+        self.proj = nn.Linear(hidden_size, num_classes)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # hidden_states: (B, Num_ECG_Tokens, Hidden)
+        logits = self.proj(hidden_states)  # (B, Num_ECG_Tokens, C)
+        logits = logits.permute(0, 2, 1)  # (B, C, Num_ECG_Tokens)
+        logits = F.interpolate(
+            logits,
+            size=self.target_length,
+            mode="linear",
+            align_corners=False,
+        )  # (B, C, Target_Length)
+        return logits
 
 
 class LlavaMetaModel:
@@ -46,6 +69,12 @@ class LlavaMetaModel:
                 self.image_newline = nn.Parameter(
                     torch.empty(config.hidden_size, dtype=self.dtype)
                 )
+
+        self.seg_head = SegmentationHead(
+            config.hidden_size,
+            num_classes=4,
+            target_length=5000,
+        )
 
     def get_ecg_tower(self):
         ecg_tower = getattr(self, 'ecg_tower', None)
@@ -211,11 +240,12 @@ class LlavaMetaForCausalLM(ABC):
         ecg_tower = self.get_ecg_tower()
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
-            return input_ids, position_ids, attention_mask, past_key_values, None, labels
+            return input_ids, position_ids, attention_mask, past_key_values, None, labels, None
         if ecgs.ndim == 2:  # if input shape is 12*5000
             ecgs = ecgs.unsqueeze(0)
 
         ecg_features = self.encode_ecgs(ecgs)
+        ecg_token_len = ecg_features.shape[1]
 
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
@@ -301,6 +331,7 @@ class LlavaMetaForCausalLM(ABC):
 
         new_input_embeds = []
         new_labels = []
+        new_ecg_token_masks = []
         cur_image_idx = 0
         for batch_idx, cur_input_ids in enumerate(input_ids):
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
@@ -310,6 +341,9 @@ class LlavaMetaForCausalLM(ABC):
                 cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
                 new_input_embeds.append(cur_input_embeds)
                 new_labels.append(labels[batch_idx])
+                new_ecg_token_masks.append(
+                    torch.zeros((cur_input_embeds.shape[0],), dtype=torch.bool, device=cur_input_embeds.device)
+                )
                 cur_image_idx += 1
                 continue
 
@@ -325,29 +359,39 @@ class LlavaMetaForCausalLM(ABC):
             cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
             cur_new_input_embeds = []
             cur_new_labels = []
+            cur_new_ecg_token_masks = []
 
             for i in range(num_images + 1):
                 cur_new_input_embeds.append(cur_input_embeds_no_im[i])
                 cur_new_labels.append(cur_labels_noim[i])
+                cur_new_ecg_token_masks.append(
+                    torch.zeros((cur_input_embeds_no_im[i].shape[0],), dtype=torch.bool, device=cur_labels.device)
+                )
                 if i < num_images:
                     cur_image_features = multimodal_features[cur_image_idx]
                     cur_image_idx += 1
                     cur_new_input_embeds.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
+                    insert_mask = torch.zeros((cur_image_features.shape[0],), dtype=torch.bool, device=cur_labels.device)
+                    insert_mask[:ecg_token_len] = True
+                    cur_new_ecg_token_masks.append(insert_mask)
 
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
 
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
+            cur_new_ecg_token_masks = torch.cat(cur_new_ecg_token_masks)
 
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
+            new_ecg_token_masks.append(cur_new_ecg_token_masks)
 
         # Truncate sequences to max length as image embeddings can make the sequence longer
         tokenizer_model_max_length = getattr(self.config, 'tokenizer_model_max_length', None)
         if tokenizer_model_max_length is not None:
             new_input_embeds = [x[:tokenizer_model_max_length] for x in new_input_embeds]
             new_labels = [x[:tokenizer_model_max_length] for x in new_labels]
+            new_ecg_token_masks = [x[:tokenizer_model_max_length] for x in new_ecg_token_masks]
 
         # Combine them
         max_len = max(x.shape[0] for x in new_input_embeds)
@@ -357,8 +401,11 @@ class LlavaMetaForCausalLM(ABC):
         new_labels_padded = torch.full((batch_size, max_len), IGNORE_INDEX, dtype=new_labels[0].dtype, device=new_labels[0].device)
         attention_mask = torch.zeros((batch_size, max_len), dtype=attention_mask.dtype, device=attention_mask.device)
         position_ids = torch.zeros((batch_size, max_len), dtype=position_ids.dtype, device=position_ids.device)
+        ecg_token_mask_padded = torch.zeros((batch_size, max_len), dtype=torch.bool, device=attention_mask.device)
 
-        for i, (cur_new_embed, cur_new_labels) in enumerate(zip(new_input_embeds, new_labels)):
+        for i, (cur_new_embed, cur_new_labels, cur_new_ecg_token_mask) in enumerate(
+            zip(new_input_embeds, new_labels, new_ecg_token_masks)
+        ):
             cur_len = cur_new_embed.shape[0]
             if getattr(self.config, 'tokenizer_padding_side', 'right') == "left":
                 new_input_embeds_padded.append(torch.cat((
@@ -369,6 +416,7 @@ class LlavaMetaForCausalLM(ABC):
                     new_labels_padded[i, -cur_len:] = cur_new_labels
                     attention_mask[i, -cur_len:] = True
                     position_ids[i, -cur_len:] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
+                    ecg_token_mask_padded[i, -cur_len:] = cur_new_ecg_token_mask
             else:
                 new_input_embeds_padded.append(torch.cat((
                     cur_new_embed,
@@ -378,6 +426,7 @@ class LlavaMetaForCausalLM(ABC):
                     new_labels_padded[i, :cur_len] = cur_new_labels
                     attention_mask[i, :cur_len] = True
                     position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
+                    ecg_token_mask_padded[i, :cur_len] = cur_new_ecg_token_mask
 
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
 
@@ -394,7 +443,7 @@ class LlavaMetaForCausalLM(ABC):
         if _position_ids is None:
             position_ids = None
 
-        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
+        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, ecg_token_mask_padded
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
         if model_args.mm_use_im_patch_token:
