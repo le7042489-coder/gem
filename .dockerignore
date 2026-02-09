@@ -19,3 +19,11 @@ __pycache__
 # Exclude some weights
 /openai
 /liuhaotian
+
+# Exclude large local artifacts / datasets
+processed_data
+data
+checkpoints
+temp_upload
+frontend/node_modules
+frontend/.next

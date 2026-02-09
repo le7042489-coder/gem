@@ -38,6 +38,7 @@ pnpm-debug.log*
 # Data (keep large/derived data out of git)
 data/
 datasets/
+processed_data/
 temp_upload/
 output/
 wandb/

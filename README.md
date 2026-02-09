@@ -147,6 +147,18 @@ After downloading all of them, organize the data as follows in `./data`,
 
 ```
 
+## Utilities
+
+### Generate ECG images from processed `.npy`
+
+If you have local `processed_data/*/*.npy`, you can generate `.png` ECG images via `gem_generation/ecg-image-generator` and update `data/mixed_train.json` to replace `.npy` image paths with `.png`:
+
+```bash
+python scripts/generate_images.py --processed-dir processed_data --json-path data/mixed_train.json
+```
+
+Install dependencies as needed (see `gem_generation/ecg-image-generator/requirements.txt`).
+
 ## Pretrained Model Preparation
 
 Pretrained ECG Encoder:
@@ -161,6 +173,27 @@ Pretrained MLLMs:
 For training from scratch:
   - step 1. specify paths in ```GEM/scripts/train_gem.sh```
   - step 2. run ```bash GEM/scripts/train_gem.sh```
+
+For fine-tuning on mixed training data (DeepSpeed + LoRA), you can use `scripts/finetune_gem_medts.sh` (defaults can be overridden via env vars):
+
+```bash
+MODEL_NAME_OR_PATH=./checkpoints/GEM-7B \
+DATA_PATH=data/mixed_train.json \
+IMAGE_FOLDER=. \
+OUTPUT_DIR=./checkpoints/gem-medts-v1 \
+bash scripts/finetune_gem_medts.sh
+```
+
+### Training data fields (JSON)
+
+- `image`: path to an ECG image (relative to `--image_folder`, or absolute).
+- `time_series` (optional): path to a `.npy` ECG signal (shape `(12, L)` or `(L, 12)`). If provided, it will be used instead of `ecg`.
+- `ecg` (optional): wfdb record path (fallback when `time_series` is missing).
+- `mask_path` (optional): path to a `.npy` segmentation label array. It will be aligned to length `5000`, and empty positions are filled with `-1` (ignored). Segmentation supervision is currently implemented for LLaMA-based models.
+
+### Training args
+
+- `--modules_to_save`: when using LoRA, additionally keep specified (non-LoRA) modules trainable and save them with the adapter (e.g. `--modules_to_save seg_head`).
 
 ## Evaluation
 
