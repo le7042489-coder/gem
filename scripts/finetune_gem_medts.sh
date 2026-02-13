@@ -6,24 +6,33 @@ cd "$ROOT_DIR"
 
 # Defaults can be overridden via env vars, e.g.:
 #   MODEL_NAME_OR_PATH=... OUTPUT_DIR=... bash scripts/finetune_gem_medts.sh
-MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-./checkpoints/GEM-7B}"
-DATA_PATH="${DATA_PATH:-data/mixed_train.json}"
-IMAGE_FOLDER="${IMAGE_FOLDER:-.}"
-OUTPUT_DIR="${OUTPUT_DIR:-./checkpoints/gem-medts-v1}"
+MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-$ROOT_DIR/checkpoints/GEM-7B}"
+DATA_PATH="${DATA_PATH:-$ROOT_DIR/data/mixed_train.json}"
+IMAGE_FOLDER="${IMAGE_FOLDER:-$ROOT_DIR}"
+ECG_FOLDER="${ECG_FOLDER:-$ROOT_DIR}"
+OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/checkpoints/gem-medts-v1}"
 
-ECG_TOWER="${ECG_TOWER:-ecg_coca/open_clip/checkpoint/cpt_wfep_epoch_20.pt}"
+ECG_TOWER="${ECG_TOWER:-$ROOT_DIR/ecg_coca/open_clip/checkpoint/cpt_wfep_epoch_20.pt}"
 OPEN_CLIP_CONFIG="${OPEN_CLIP_CONFIG:-coca_ViT-B-32}"
 VISION_TOWER="${VISION_TOWER:-openai/clip-vit-large-patch14-336}"
+DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-$ROOT_DIR/scripts/zero2.json}"
+
+for path in "$MODEL_NAME_OR_PATH" "$DATA_PATH" "$IMAGE_FOLDER" "$ECG_FOLDER" "$ECG_TOWER" "$DEEPSPEED_CONFIG"; do
+  if [ ! -e "$path" ]; then
+    echo "Error: required path not found: $path" >&2
+    exit 1
+  fi
+done
 
 # If you run out of VRAM, reduce batch size / increase grad accumulation, and
 # consider keeping only: --modules_to_save seg_head
-deepspeed llava/train/train_mem.py \
-  --deepspeed ./scripts/zero2.json \
+deepspeed "$ROOT_DIR/llava/train/train_mem.py" \
+  --deepspeed "$DEEPSPEED_CONFIG" \
   --model_name_or_path "$MODEL_NAME_OR_PATH" \
   --version llava_v1 \
   --data_path "$DATA_PATH" \
   --image_folder "$IMAGE_FOLDER" \
-  --ecg_folder "$IMAGE_FOLDER" \
+  --ecg_folder "$ECG_FOLDER" \
   --ecg_tower "$ECG_TOWER" \
   --open_clip_config "$OPEN_CLIP_CONFIG" \
   --vision_tower "$VISION_TOWER" \
@@ -55,4 +64,3 @@ deepspeed llava/train/train_mem.py \
   --tf32 True \
   --lazy_preprocess True \
   --report_to "none"
-
