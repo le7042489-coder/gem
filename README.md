@@ -85,6 +85,27 @@ Some evaluation scripts require API keys (e.g., OpenAI). Use an untracked `.env`
 cp .env.example .env
 ```
 
+### GEM+ Inference API (Phase 1)
+
+The backend now supports a lightweight GEM+ inference flow:
+
+- `GET /samples`: list local indexed samples.
+- `POST /predict_plus/by_id`: run inference from indexed sample id.
+- `POST /predict_plus/upload`: run inference from uploaded `.npy` (optional `.png` preview sidecar).
+- `GET /images/{image_id}`: fetch the standard 3x4 rendered ECG image used by both model input and viewer.
+
+`/predict_plus/*` responses no longer embed `image_base64`; instead they return `viewer.image_id` plus preprocessing/debug metadata:
+
+- `fs_used`
+- `preprocess`: `fs_original`, `len_original`, `resampled`, `resample_method`, `cropped`, `padded`
+- `validation_warnings`
+
+Key defaults:
+
+- signals are normalized to `fs_used=500`
+- resampling uses `scipy.signal.resample_poly` when `fs_original != 500`
+- viewer highlighting is computed from `lead + t_start_ms + t_end_ms` on the fixed `standard_3x4` layout
+
 ## Project Structure
 
 ```

@@ -1109,42 +1109,6 @@ def train(attn_implementation=None):
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-    if training_args.lora_enable:
-        from peft import LoraConfig, get_peft_model
-        lora_config_kwargs = dict(
-            r=training_args.lora_r,
-            lora_alpha=training_args.lora_alpha,
-            target_modules=find_all_linear_names(model),
-            lora_dropout=training_args.lora_dropout,
-            bias=training_args.lora_bias,
-            task_type="CAUSAL_LM",
-        )
-        if training_args.modules_to_save:
-            lora_config_kwargs["modules_to_save"] = training_args.modules_to_save
-        try:
-            lora_config = LoraConfig(**lora_config_kwargs)
-        except TypeError as e:
-            if "modules_to_save" in str(e):
-                lora_config_kwargs.pop("modules_to_save", None)
-                lora_config = LoraConfig(**lora_config_kwargs)
-            else:
-                raise
-        if training_args.bits == 16:
-            if training_args.bf16:
-                model.to(torch.bfloat16)
-            if training_args.fp16:
-                model.to(torch.float16)
-        rank0_print("Adding LoRA adapters...")
-        model = get_peft_model(model, lora_config)
-        if training_args.modules_to_save:
-            has_modules_to_save_wrapper = any("modules_to_save" in n for n, _ in model.named_parameters())
-            if not has_modules_to_save_wrapper:
-                module_names_to_unfreeze = set(training_args.modules_to_save)
-                for module_name, module in model.named_modules():
-                    if module_name.split(".")[-1] in module_names_to_unfreeze:
-                        for p in module.parameters():
-                            p.requires_grad = True
-
     if 'mpt' in model_args.model_name_or_path:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
@@ -1239,6 +1203,44 @@ def train(attn_implementation=None):
         for p in model.get_model().seg_head.parameters():
             p.requires_grad = True
 
+    model.resize_token_embeddings(len(tokenizer))
+
+    if training_args.lora_enable:
+        from peft import LoraConfig, get_peft_model
+        lora_config_kwargs = dict(
+            r=training_args.lora_r,
+            lora_alpha=training_args.lora_alpha,
+            target_modules=find_all_linear_names(model),
+            lora_dropout=training_args.lora_dropout,
+            bias=training_args.lora_bias,
+            task_type="CAUSAL_LM",
+        )
+        if training_args.modules_to_save:
+            lora_config_kwargs["modules_to_save"] = training_args.modules_to_save
+        try:
+            lora_config = LoraConfig(**lora_config_kwargs)
+        except TypeError as e:
+            if "modules_to_save" in str(e):
+                lora_config_kwargs.pop("modules_to_save", None)
+                lora_config = LoraConfig(**lora_config_kwargs)
+            else:
+                raise
+        if training_args.bits == 16:
+            if training_args.bf16:
+                model.to(torch.bfloat16)
+            if training_args.fp16:
+                model.to(torch.float16)
+        rank0_print("Adding LoRA adapters...")
+        model = get_peft_model(model, lora_config)
+        if training_args.modules_to_save:
+            has_modules_to_save_wrapper = any("modules_to_save" in n for n, _ in model.named_parameters())
+            if not has_modules_to_save_wrapper:
+                module_names_to_unfreeze = set(training_args.modules_to_save)
+                for module_name, module in model.named_modules():
+                    if module_name.split(".")[-1] in module_names_to_unfreeze:
+                        for p in module.parameters():
+                            p.requires_grad = True
+
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
         for name, module in model.named_modules():
@@ -1252,8 +1254,6 @@ def train(attn_implementation=None):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
 
-    model.resize_token_embeddings(len(tokenizer))
-    
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args,
                                               model_config=model.config)
