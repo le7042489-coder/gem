@@ -17,10 +17,11 @@
 import os
 import copy
 from dataclasses import dataclass, field
+from fractions import Fraction
 import json
 import logging
 import pathlib
-from typing import Dict, Optional, Sequence, List
+from typing import Any, Dict, Optional, Sequence, List, Tuple
 
 import torch
 
@@ -39,6 +40,7 @@ from PIL import Image
 
 import wfdb
 import numpy as np
+import scipy.signal
 # os.environ["WANDB_DISABLED"] = "true"
 
 local_rank = None
@@ -84,6 +86,8 @@ class DataArguments:
     image_aspect_ratio: str = 'square'
     ecg_folder: Optional[str] = field(default=None)
     ecg_seq_length: Optional[int] = field(default=5000)
+    ecg_target_fs: int = field(default=500)
+    ecg_default_fs: float = field(default=500.0)
 
 
 @dataclass
@@ -755,6 +759,154 @@ def preprocess(
     return dict(input_ids=input_ids, labels=targets)
 
 
+def _as_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_fs_original(sample: Dict[str, Any], default_fs: float) -> float:
+    for key in ("fs_original", "fs", "sampling_rate"):
+        v = _as_float(sample.get(key))
+        if v is not None:
+            return v
+    meta = sample.get("metadata")
+    if isinstance(meta, dict):
+        for key in ("fs_original", "fs", "sampling_rate"):
+            v = _as_float(meta.get(key))
+            if v is not None:
+                return v
+    return float(default_fs)
+
+
+def _transpose_to_12_leads(signal: np.ndarray, source_name: str) -> np.ndarray:
+    if signal.ndim != 2:
+        raise ValueError(f"{source_name} must be a 2D array. Got shape={signal.shape}")
+    if signal.shape[0] == 12:
+        return signal
+    if signal.shape[1] == 12:
+        return np.transpose(signal, (1, 0))
+    raise ValueError(f"{source_name} must be shaped (12, L) or (L, 12). Got shape={signal.shape}")
+
+
+def _sanitize_signal(signal_12l: np.ndarray) -> np.ndarray:
+    out = np.asarray(signal_12l).astype(np.float32, copy=False)
+    out[np.isnan(out)] = 0
+    out[np.isinf(out)] = 0
+    return out
+
+
+def _resample_signal(signal_12l: np.ndarray, fs_original: float, fs_target: int) -> Tuple[np.ndarray, bool]:
+    fs_original = float(fs_original)
+    fs_target = int(fs_target)
+    if fs_original <= 0:
+        fs_original = float(fs_target)
+    if abs(fs_original - float(fs_target)) < 1e-6:
+        return signal_12l, False
+    ratio = Fraction(fs_target / fs_original).limit_denominator(10_000)
+    up = ratio.numerator
+    down = ratio.denominator
+    resampled = scipy.signal.resample_poly(signal_12l, up=up, down=down, axis=1)
+    return np.asarray(resampled, dtype=np.float32), True
+
+
+def _pad_or_crop(signal_12l: np.ndarray, seq_length: int) -> np.ndarray:
+    seq_length = int(seq_length)
+    if signal_12l.shape[1] > seq_length:
+        return signal_12l[:, :seq_length]
+    if signal_12l.shape[1] < seq_length:
+        pad = seq_length - signal_12l.shape[1]
+        return np.pad(signal_12l, ((0, 0), (0, pad)))
+    return signal_12l
+
+
+def _normalize_ecg_signal(
+    signal: np.ndarray,
+    fs_original: float,
+    fs_target: int,
+    seq_length: int,
+    source_name: str,
+) -> np.ndarray:
+    signal_12l = _transpose_to_12_leads(np.asarray(signal), source_name=source_name)
+    signal_12l = _sanitize_signal(signal_12l)
+    signal_12l, _ = _resample_signal(signal_12l, fs_original=fs_original, fs_target=fs_target)
+    signal_12l = _pad_or_crop(signal_12l, seq_length=seq_length)
+    return np.asarray(signal_12l, dtype=np.float32)
+
+
+def _resolve_file_path(path_str: str, roots: Sequence[Optional[str]], data_path: Optional[str]) -> str:
+    raw = str(path_str)
+    attempts: List[str] = []
+
+    if os.path.isabs(raw):
+        attempts.append(raw)
+        if os.path.exists(raw):
+            return raw
+
+    attempts.append(raw)
+    if os.path.exists(raw):
+        return raw
+
+    for root in roots:
+        if root:
+            cand = os.path.join(root, raw)
+            attempts.append(cand)
+            if os.path.exists(cand):
+                return cand
+
+    if data_path:
+        dataset_dir = os.path.dirname(os.path.abspath(str(data_path)))
+        cand = os.path.join(dataset_dir, raw)
+        attempts.append(cand)
+        if os.path.exists(cand):
+            return cand
+
+    raise FileNotFoundError(f"File not found: {raw!r}. Tried: {attempts}")
+
+
+def _resolve_wfdb_record(record: str, roots: Sequence[Optional[str]], data_path: Optional[str]) -> str:
+    raw = str(record)
+    candidates: List[str] = []
+
+    if os.path.isabs(raw):
+        candidates.append(raw)
+    else:
+        candidates.append(raw)
+        for root in roots:
+            if root:
+                candidates.append(os.path.join(root, raw))
+        if data_path:
+            dataset_dir = os.path.dirname(os.path.abspath(str(data_path)))
+            candidates.append(os.path.join(dataset_dir, raw))
+
+    # wfdb records are typically referenced without extension; check for a header.
+    for base in candidates:
+        hea = base + ".hea"
+        if os.path.exists(hea):
+            return base
+    return candidates[0]
+
+
+def _align_mask_to_length(mask_np: np.ndarray, target_len: int) -> np.ndarray:
+    flat = np.asarray(mask_np).squeeze().reshape(-1).astype(np.int64, copy=False)
+    target_len = int(target_len)
+    if target_len <= 0:
+        raise ValueError(f"Invalid target_len for mask alignment: {target_len}")
+    if flat.size == 0:
+        return np.full((target_len,), -1, dtype=np.int64)
+    if flat.shape[0] == target_len:
+        return flat
+    src_len = int(flat.shape[0])
+    idx = (np.arange(target_len, dtype=np.float64) * (float(src_len) / float(target_len))).astype(np.int64)
+    idx = np.clip(idx, 0, src_len - 1)
+    return flat[idx]
+
+
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
@@ -798,6 +950,9 @@ class LazySupervisedDataset(Dataset):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
         sample = sources[0]
+        seq_length = int(self.data_args.ecg_seq_length or 5000)
+        fs_target = int(getattr(self.data_args, "ecg_target_fs", 500) or 500)
+        default_fs = float(getattr(self.data_args, "ecg_default_fs", float(fs_target)) or float(fs_target))
         if 'image' in sample:
             #! read ecg files (new: `time_series` .npy, fallback: wfdb `ecg`)
             time_series = sample.get("time_series", None)
@@ -808,34 +963,21 @@ class LazySupervisedDataset(Dataset):
             )
             if has_time_series:
                 time_series = str(time_series)
-                if os.path.isabs(time_series):
-                    signal_path = time_series
-                else:
-                    signal_path = os.path.join(self.data_args.image_folder, time_series)
-
+                signal_path = _resolve_file_path(
+                    time_series,
+                    roots=[self.data_args.image_folder, self.data_args.ecg_folder],
+                    data_path=self.data_path,
+                )
                 signal = np.load(signal_path)
-                signal = np.asarray(signal).astype(np.float32)
-                if signal.ndim != 2:
-                    raise ValueError(f"`time_series` must be a 2D array. Got shape={signal.shape} from {signal_path!r}")
-                if signal.shape[0] == 12:
-                    pass
-                elif signal.shape[1] == 12:
-                    signal = np.transpose(signal, (1, 0))
-                else:
-                    raise ValueError(f"`time_series` must be shaped (12, L) or (L, 12). Got shape={signal.shape} from {signal_path!r}")
-
-                signal[np.isnan(signal)] = 0
-                signal[np.isinf(signal)] = 0
-                c, length = signal.shape
-                seq_length = self.data_args.ecg_seq_length
-                if length < seq_length:
-                    new_ecg = np.zeros((c, seq_length), dtype=np.float32)
-                    new_ecg[:, 0:length] = signal
-                    signal = new_ecg
-                elif length > seq_length:
-                    signal = signal[:, 0:seq_length]
-
-                ecg = torch.from_numpy(signal)
+                fs_original = _extract_fs_original(sample, default_fs=default_fs)
+                signal_norm = _normalize_ecg_signal(
+                    signal,
+                    fs_original=fs_original,
+                    fs_target=fs_target,
+                    seq_length=seq_length,
+                    source_name=f"time_series {signal_path}",
+                )
+                ecg = torch.from_numpy(signal_norm)
             else:
                 ecg_file = sample.get("ecg", None)
                 has_ecg = (
@@ -847,25 +989,33 @@ class LazySupervisedDataset(Dataset):
                     raise KeyError("Sample is missing both `time_series` and `ecg` for ECG loading.")
 
                 ecg_file = str(ecg_file)
-                ecg_folder = self.data_args.ecg_folder
-                ecg = wfdb.rdsamp(os.path.join(ecg_folder, ecg_file))[0]
-                ecg[np.isnan(ecg)] = 0
-                ecg[np.isinf(ecg)] = 0
-                ecg = torch.Tensor(np.transpose(ecg, (1, 0)).astype(np.float32))
-                c, length = ecg.shape
-                seq_length = self.data_args.ecg_seq_length
-                if length < seq_length:
-                    new_ecg = torch.zeros((c, seq_length))
-                    new_ecg[:, 0:length] = ecg
-                    ecg = new_ecg
-                elif length > seq_length:
-                    ecg = ecg[:, 0:seq_length]     
+                record_path = _resolve_wfdb_record(
+                    ecg_file,
+                    roots=[self.data_args.ecg_folder, self.data_args.image_folder],
+                    data_path=self.data_path,
+                )
+                wfdb_signal, wfdb_meta = wfdb.rdsamp(record_path)
+                fs_original = _as_float(wfdb_meta.get("fs")) or _extract_fs_original(sample, default_fs=default_fs)
+                signal_lc = np.transpose(wfdb_signal, (1, 0))
+                signal_norm = _normalize_ecg_signal(
+                    signal_lc,
+                    fs_original=fs_original,
+                    fs_target=fs_target,
+                    seq_length=seq_length,
+                    source_name=f"wfdb {record_path}",
+                )
+                ecg = torch.from_numpy(signal_norm)
 
             #! read image files
             image_file = sample['image']
             image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
-            image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+            image_path = _resolve_file_path(
+                str(image_file),
+                roots=[image_folder],
+                data_path=self.data_path,
+            )
+            image = Image.open(image_path).convert('RGB')
             image_size = image.size
             assert self.data_args.image_aspect_ratio in ['pad', 'anyres', 'ori']
             if self.data_args.image_aspect_ratio == 'pad':
@@ -907,7 +1057,7 @@ class LazySupervisedDataset(Dataset):
             data_dict['image'] = image
             data_dict['image_size'] = image_size
         elif self.data_args.is_multimodal:
-            data_dict['ecg'] = torch.zeros(12, 5000)
+            data_dict['ecg'] = torch.zeros(12, seq_length)
             # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size
             data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
@@ -920,22 +1070,16 @@ class LazySupervisedDataset(Dataset):
         )
         if has_mask:
             mask_path = str(mask_path)
-            if os.path.isabs(mask_path):
-                mask_full_path = mask_path
-            else:
-                mask_full_path = os.path.join(self.data_args.image_folder, mask_path)
-            if not os.path.exists(mask_full_path):
-                raise FileNotFoundError(f"Segmentation mask file not found for mask_path={mask_path!r}")
-
+            mask_full_path = _resolve_file_path(
+                mask_path,
+                roots=[self.data_args.image_folder, self.data_args.ecg_folder],
+                data_path=self.data_path,
+            )
             mask_np = np.load(mask_full_path)
-            mask_np = np.asarray(mask_np).squeeze().reshape(-1).astype(np.int64, copy=False)
-            target_len = 5000
-            aligned = np.full((target_len,), -1, dtype=np.int64)
-            copy_len = min(mask_np.shape[0], target_len)
-            aligned[:copy_len] = mask_np[:copy_len]
+            aligned = _align_mask_to_length(mask_np, target_len=seq_length)
             labels_segmentation = torch.from_numpy(aligned).long()
         else:
-            labels_segmentation = torch.full((5000,), -1, dtype=torch.long)
+            labels_segmentation = torch.full((seq_length,), -1, dtype=torch.long)
 
         data_dict["labels_segmentation"] = labels_segmentation
 
@@ -974,10 +1118,11 @@ class DataCollatorForSupervisedDataset(object):
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
 
+        labels_seg_len = None
         if "labels_segmentation" in instances[0]:
             labels_seg_list = [instance["labels_segmentation"] for instance in instances]
             batch["labels_segmentation"] = torch.stack(labels_seg_list).long()
-            assert batch["labels_segmentation"].shape[1] == 5000
+            labels_seg_len = batch["labels_segmentation"].shape[1]
 
         if 'ecg' in instances[0]:
             ecgs = [instance['ecg'] for instance in instances]
@@ -985,6 +1130,8 @@ class DataCollatorForSupervisedDataset(object):
                 batch['ecgs'] = torch.stack(ecgs)
             else:
                 batch['ecgs'] = ecgs
+            if labels_seg_len is not None and isinstance(batch.get("ecgs"), torch.Tensor):
+                assert batch["ecgs"].shape[-1] == labels_seg_len
 
         if 'image' in instances[0]:
             images = [instance['image'] for instance in instances]

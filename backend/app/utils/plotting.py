@@ -3,6 +3,8 @@ from io import BytesIO
 
 import numpy as np
 from PIL import Image
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from .parsing import LEAD_INDEX, SEGMENT_SECONDS, TOTAL_SECONDS
