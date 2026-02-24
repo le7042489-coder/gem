@@ -1,51 +1,85 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-while getopts m:h option
-do
- case "${option}"
- in
-  m) model_name=${OPTARG};;        # Model name
-  h) echo "Usage: $0 -m model_name"
-     exit 0;;
- esac
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT_DIR"
+
+model_name=""
+question_glob="data/ecg_bench/chunks/*.json"
+question_files=""
+gpu_list="${GPU_LIST:-0,1,2,3,4,5,6,7}"
+pipeline_config="${PIPELINE_CONFIG:-configs/pipelines/gem_default.yaml}"
+extra_args=()
+
+usage() {
+  cat <<'USAGE'
+Usage: bench_ecggrounding.sh -m MODEL_PATH [-g GLOB] [-f FILE1,FILE2] [-p GPU_IDS] [-c CONFIG] [--dry-run]
+
+Legacy compatibility:
+  -m model path/name
+
+Optional:
+  -g glob pattern for chunked question files (default: data/ecg_bench/chunks/*.json)
+  -f comma-separated explicit question files (overrides -g)
+  -p comma-separated GPU ids (default: 0,1,2,3,4,5,6,7)
+  -c pipeline config path
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -m)
+      model_name="${2:-}"; shift 2 ;;
+    -g)
+      question_glob="${2:-}"; shift 2 ;;
+    -f)
+      question_files="${2:-}"; shift 2 ;;
+    -p)
+      gpu_list="${2:-}"; shift 2 ;;
+    -c)
+      pipeline_config="${2:-}"; shift 2 ;;
+    -h|--help)
+      usage; exit 0 ;;
+    *)
+      extra_args+=("$1"); shift ;;
+  esac
 done
 
 if [[ -z "$model_name" ]]; then
-    echo "Error: Missing required parameters. Use -h for help."
-    exit 1
+  usage
+  echo "Error: -m is required." >&2
+  exit 1
 fi
 
-# test data chunks
-splits=("chunk_0" "chunk_1" "chunk_2" "chunk_3" "chunk_4" "chunk_5" "chunk_6" "chunk_7")
+model_path="$model_name"
+if [[ -n "${CKPT_DIR:-}" && ! "$model_name" = /* ]]; then
+  model_path="${CKPT_DIR%/}/${model_name}"
+fi
 
-SAVE_DIR=../../eval_outputs
-CKPT_DIR=
+echo "[migration] evaluation/gem_bench/bench_ecggrounding.sh delegates to scripts/gem_pipeline.py eval-generate-grounding"
 
-model_path=${CKPT_DIR}/${model_name}
+set_args=(
+  "--set" "evaluation.grounding.model_path=${model_path}"
+  "--set" "evaluation.grounding.gpus=[${gpu_list}]"
+)
 
-# one chunk per GPU
-for i in "${!splits[@]}"; do
-    split=${splits[$i]}
-    save_dir=${SAVE_DIR}/${model_name}/ecg-grounding-test
+if [[ -n "$question_files" ]]; then
+  IFS=',' read -r -a file_array <<<"$question_files"
+  json_array="["
+  for i in "${!file_array[@]}"; do
+    file="$(echo "${file_array[$i]}" | xargs)"
+    [[ -z "$file" ]] && continue
+    [[ $i -gt 0 ]] && json_array+=", "
+    json_array+="\"${file}\""
+  done
+  json_array+="]"
+  set_args+=("--set" "evaluation.grounding.question_files=${json_array}")
+else
+  set_args+=("--set" "evaluation.grounding.question_files_glob=${question_glob}")
+fi
 
-    if [ ! -d "$save_dir" ]; then
-        mkdir -p "$save_dir"
-    fi
-
-    gpu_id=$((i % 8))
-
-    echo "Running on GPU $gpu_id with question file: $split"
-
-    CUDA_VISIBLE_DEVICES=$gpu_id python ../../llava/eval/model_ecg_resume.py \
-        --model-path "$model_path" \
-        --image-folder "" \
-        --question-file "...path/$split.json" \
-        --answers-file "${save_dir}/${split}-step-final.jsonl" \
-        --conv-mode "llava_v1" \
-        --ecg-folder "" \
-        --ecg_tower "" \
-        --open_clip_config "coca_ViT-B-32" &  
-done
-
-wait
-echo "All evaluations are completed."
+exec python "$ROOT_DIR/scripts/gem_pipeline.py" \
+  eval-generate-grounding \
+  --config "$pipeline_config" \
+  "${set_args[@]}" \
+  "${extra_args[@]}"

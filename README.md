@@ -85,6 +85,31 @@ Some evaluation scripts require API keys (e.g., OpenAI). Use an untracked `.env`
 cp .env.example .env
 ```
 
+## Unified Pipeline (Recommended)
+
+Training/evaluation orchestration is now standardized via:
+
+```bash
+python scripts/gem_pipeline.py <subcommand> --config configs/pipelines/gem_default.yaml
+```
+
+Supported subcommands:
+
+- `validate-config`
+- `train`
+- `finetune`
+- `eval-generate-ecgbench`
+- `eval-generate-grounding`
+- `eval-score-ecgbench`
+- `eval-score-report`
+- `grounding-merge`
+- `grounding-gpt-eval`
+- `grounding-score`
+
+You can override any config value with repeated `--set key=value`, and use `--dry-run` to inspect commands.
+
+Legacy LLaVA script migration details: `docs/migrations/llava_scripts_legacy.md`.
+
 ### GEM+ Inference API (Phase 1)
 
 The backend now supports a lightweight GEM+ inference flow:
@@ -191,17 +216,31 @@ Pretrained MLLMs:
 
 ## Train
 
-For training from scratch:
-  - step 1. specify paths in ```GEM/scripts/train_gem.sh```
-  - step 2. run ```bash GEM/scripts/train_gem.sh```
-
-For fine-tuning on mixed training data (DeepSpeed + LoRA), you can use `scripts/finetune_gem_medts.sh` (defaults can be overridden via env vars):
+For training from scratch (recommended):
 
 ```bash
-MODEL_NAME_OR_PATH=./checkpoints/GEM-7B \
-DATA_PATH=data/mixed_train.json \
-IMAGE_FOLDER=. \
-OUTPUT_DIR=./checkpoints/gem-medts-v1 \
+python scripts/gem_pipeline.py train --config configs/pipelines/gem_default.yaml
+```
+
+Legacy command (still supported during migration window):
+
+```bash
+bash scripts/train_gem.sh
+```
+
+For fine-tuning on mixed training data (DeepSpeed + LoRA):
+
+```bash
+python scripts/gem_pipeline.py finetune --config configs/pipelines/gem_default.yaml \
+  --set finetune.model_name_or_path=./checkpoints/GEM-7B \
+  --set finetune.data_path=data/mixed_train.json \
+  --set finetune.image_folder=. \
+  --set finetune.output_dir=./checkpoints/gem-medts-v1
+```
+
+Legacy command (still supported during migration window):
+
+```bash
 bash scripts/finetune_gem_medts.sh
 ```
 
@@ -219,20 +258,27 @@ bash scripts/finetune_gem_medts.sh
 ## Evaluation
 
 For ECG-Grounding:
-  - step 1. generate interpretations: ```GEM/evaluation/gem_bench/bench_ecggrounding.sh```
-  - step 2. process interpretations: ```GEM/gem_evaluation/process_gem_outputs.ipynb```
-  - step 3. generate GPT evaluation reports: ```GEM/gem_evaluation/generate_gpt_eval.py```
-  - step 4. process evaluation reports and get scores: ```GEM/gem_evaluation/process_grounding_scores.ipynb```
+  - step 1. generate interpretations:
+    - `python scripts/gem_pipeline.py eval-generate-grounding --config configs/pipelines/gem_default.yaml --set evaluation.grounding.question_files_glob='data/ecg_bench/chunks/*.json'`
+  - step 2. merge model outputs:
+    - `python scripts/gem_pipeline.py grounding-merge --config configs/pipelines/gem_default.yaml`
+  - step 3. generate GPT evaluation reports:
+    - `python scripts/gem_pipeline.py grounding-gpt-eval --config configs/pipelines/gem_default.yaml`
+  - step 4. aggregate grounding scores:
+    - `python scripts/gem_pipeline.py grounding-score --config configs/pipelines/gem_default.yaml`
 
 For ECG-Bench:
-  - step 1. generate results: ```GEM/evaluation/gem_bench/bench_ecgbench.sh```
-  - step 2. evaluate results: ```GEM/evaluation/evaluate_ecgbench.py```
-  - step 3. evaluate reports: ```GEM/evaluation/eval_report.py```
+  - step 1. generate results:
+    - `python scripts/gem_pipeline.py eval-generate-ecgbench --config configs/pipelines/gem_default.yaml`
+  - step 2. evaluate benchmark results:
+    - `python scripts/gem_pipeline.py eval-score-ecgbench --config configs/pipelines/gem_default.yaml`
+  - step 3. evaluate reports:
+    - `python scripts/gem_pipeline.py eval-score-report --config configs/pipelines/gem_default.yaml`
 
 *Note*
-- 1. You need to specify the result paths in all evaluation scripts (For ECG-Bench, you also need to specify the path to question files in evaluate_ecgbench.py).
+- 1. All path/model overrides can be passed through `--set key=value` in `scripts/gem_pipeline.py`.
 - 2. If you download our trained GEM-7B model from HuggingFace, you must set the path to ECG-CoCa in the config.json file (under "mm_ecg_tower") before using it.
-- 3. bench_ecggrounding.sh is designed to use multiple GPUs to generate interpretations simultaneously, reducing generation time. To use it, you must split the test file (ecg-grounding-test-mimiciv.json) into multiple chunks. If you prefer a simpler setup, you can use bench_ecgbench.sh instead. The core generation functions are the same. Example usage: ```bash bench_ecgbench.sh -m PATH_TO_GEM -d ecg-grounding-test-mimiciv```.
+- 3. `evaluation/gem_bench/bench_ecgbench.sh` and `evaluation/gem_bench/bench_ecggrounding.sh` are compatibility wrappers to the new pipeline and still accept legacy `-m/-d` style arguments.
  
 
 ## Citation

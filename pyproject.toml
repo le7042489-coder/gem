@@ -22,6 +22,7 @@ dependencies = [
     "einops==0.6.1", "einops-exts==0.0.4", "timm==0.6.13",
     "python-dotenv",
     "scipy",
+    "pyyaml",
 ]
 
 [project.optional-dependencies]

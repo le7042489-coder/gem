@@ -20,3 +20,4 @@ python-dotenv
 python-multipart
 scikit-learn==1.2.2
 ftfy
+pyyaml

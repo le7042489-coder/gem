@@ -4,85 +4,46 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-# Distributed training configuration.
-GPUS_PER_NODE="${GPUS_PER_NODE:-1}"
-NNODES="${NNODES:-1}"
-NODE_RANK="${NODE_RANK:-0}"
-MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-MASTER_PORT="${MASTER_PORT:-1234}"
-WORLD_SIZE=$((GPUS_PER_NODE * NNODES))
+echo "[migration] scripts/train_gem.sh now delegates to scripts/gem_pipeline.py train"
+echo "[migration] prefer: python scripts/gem_pipeline.py train --config configs/pipelines/gem_default.yaml"
 
-# Optional Hugging Face cache path.
-export HF_HOME="${HF_HOME:-$ROOT_DIR/.cache/huggingface}"
+PIPELINE_CONFIG="${PIPELINE_CONFIG:-configs/pipelines/gem_default.yaml}"
+SET_ARGS=()
 
-LLM_VERSION="${LLM_VERSION:-$ROOT_DIR/checkpoints/GEM-7B}"
-LLM_VERSION_CLEAN="${LLM_VERSION//\//_}"
-DATA_VERSION="${DATA_VERSION:-mixed_train}"
-BASE_RUN_NAME="${BASE_RUN_NAME:-GEM-${LLM_VERSION_CLEAN}-${DATA_VERSION}-finetune}"
-echo "BASE_RUN_NAME: ${BASE_RUN_NAME}"
+append_set() {
+  local key="$1"
+  local value="$2"
+  SET_ARGS+=("--set" "${key}=${value}")
+}
 
-version="${VERSION:-llava_v1}"
+[[ -n "${LLM_VERSION:-}" ]] && append_set "train.model_name_or_path" "${LLM_VERSION}"
+[[ -n "${DATA_PATH:-}" ]] && append_set "train.data_path" "${DATA_PATH}"
+[[ -n "${IMAGE_FOLDER:-}" ]] && append_set "train.image_folder" "${IMAGE_FOLDER}"
+[[ -n "${ECG_FOLDER:-}" ]] && append_set "train.ecg_folder" "${ECG_FOLDER}"
+[[ -n "${ECG_TOWER:-}" ]] && append_set "paths.ecg_tower" "${ECG_TOWER}"
+[[ -n "${DEEPSPEED_CONFIG:-}" ]] && append_set "train.deepspeed_config" "${DEEPSPEED_CONFIG}"
+[[ -n "${VERSION:-}" ]] && append_set "train.version" "${VERSION}"
+[[ -n "${REPORT_TO:-}" ]] && append_set "train.report_to" "${REPORT_TO}"
 
-data_path="${DATA_PATH:-$ROOT_DIR/data/mixed_train.json}"
-image_folder="${IMAGE_FOLDER:-$ROOT_DIR}"
-ecg_folder="${ECG_FOLDER:-$ROOT_DIR}"
-ecg_tower="${ECG_TOWER:-$ROOT_DIR/ecg_coca/open_clip/checkpoint/cpt_wfep_epoch_20.pt}"
-deepspeed_config="${DEEPSPEED_CONFIG:-$ROOT_DIR/scripts/zero2.json}"
-report_to="${REPORT_TO:-none}"
+[[ -n "${GPUS_PER_NODE:-}" ]] && append_set "train.gpus_per_node" "${GPUS_PER_NODE}"
+[[ -n "${NNODES:-}" ]] && append_set "train.nnodes" "${NNODES}"
+[[ -n "${NODE_RANK:-}" ]] && append_set "train.node_rank" "${NODE_RANK}"
+[[ -n "${MASTER_ADDR:-}" ]] && append_set "train.master_addr" "${MASTER_ADDR}"
+[[ -n "${MASTER_PORT:-}" ]] && append_set "train.master_port" "${MASTER_PORT}"
 
-num_epochs="${NUM_EPOCHS:-1}"
-GRAD_ACC_STEP="${GRAD_ACC_STEP:-2}"
-BATCH_PER_GPU="${BATCH_PER_GPU:-16}"
-TOTAL_BATCH_SIZE=$((WORLD_SIZE * BATCH_PER_GPU))
-echo "WORLD_SIZE: ${WORLD_SIZE}, TOTAL_BATCH_SIZE: ${TOTAL_BATCH_SIZE}"
+[[ -n "${NUM_EPOCHS:-}" ]] && append_set "train.num_train_epochs" "${NUM_EPOCHS}"
+[[ -n "${GRAD_ACC_STEP:-}" ]] && append_set "train.grad_acc_step" "${GRAD_ACC_STEP}"
+[[ -n "${BATCH_PER_GPU:-}" ]] && append_set "train.batch_per_gpu" "${BATCH_PER_GPU}"
+[[ -n "${DATALOADER_NUM_WORKERS:-}" ]] && append_set "train.dataloader_num_workers" "${DATALOADER_NUM_WORKERS}"
 
-for path in "$LLM_VERSION" "$data_path" "$image_folder" "$ecg_folder" "$ecg_tower" "$deepspeed_config"; do
-    if [ ! -e "$path" ]; then
-        echo "Error: required path not found: $path" >&2
-        exit 1
-    fi
-done
+if [[ -n "${OUTPUT_DIR:-}" ]]; then
+  append_set "train.output_dir" "${OUTPUT_DIR}"
+elif [[ -n "${BASE_RUN_NAME:-}" ]]; then
+  append_set "train.output_dir" "${ROOT_DIR}/checkpoints/${BASE_RUN_NAME}"
+fi
 
-torchrun \
-    --nproc_per_node "$GPUS_PER_NODE" \
-    --master_addr "$MASTER_ADDR" \
-    --node_rank "$NODE_RANK" \
-    --master_port "$MASTER_PORT" \
-    --nnodes "$NNODES" \
-    "$ROOT_DIR/llava/train/train_mem.py" \
-    --deepspeed "$deepspeed_config" \
-    --model_name_or_path "$LLM_VERSION" \
-    --version "$version" \
-    --data_path "$data_path" \
-    --ecg_folder "$ecg_folder" \
-    --ecg_tower "$ecg_tower" \
-    --open_clip_config coca_ViT-B-32 \
-    --image_folder "$image_folder" \
-    --vision_tower openai/clip-vit-large-patch14-336 \
-    --mm_projector_type mlp2x_gelu \
-    --mm_vision_select_layer -2 \
-    --mm_use_im_start_end False \
-    --mm_use_im_patch_token False \
-    --image_aspect_ratio ori \
-    --group_by_modality_length False \
-    --bf16 True \
-    --output_dir "$ROOT_DIR/checkpoints/${BASE_RUN_NAME}" \
-    --num_train_epochs "$num_epochs" \
-    --per_device_train_batch_size "$BATCH_PER_GPU" \
-    --per_device_eval_batch_size "$BATCH_PER_GPU" \
-    --gradient_accumulation_steps "$GRAD_ACC_STEP" \
-    --evaluation_strategy "no" \
-    --save_strategy "steps" \
-    --save_steps 0.2 \
-    --save_total_limit 5 \
-    --learning_rate 2e-5 \
-    --weight_decay 0. \
-    --warmup_ratio 0.03 \
-    --lr_scheduler_type "cosine" \
-    --logging_steps 1 \
-    --tf32 True \
-    --model_max_length 4096 \
-    --gradient_checkpointing True \
-    --dataloader_num_workers 64 \
-    --lazy_preprocess True \
-    --report_to "$report_to"
+exec python "$ROOT_DIR/scripts/gem_pipeline.py" \
+  train \
+  --config "$PIPELINE_CONFIG" \
+  "${SET_ARGS[@]}" \
+  "$@"

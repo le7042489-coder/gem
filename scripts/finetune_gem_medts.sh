@@ -4,63 +4,35 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-# Defaults can be overridden via env vars, e.g.:
-#   MODEL_NAME_OR_PATH=... OUTPUT_DIR=... bash scripts/finetune_gem_medts.sh
-MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-$ROOT_DIR/checkpoints/GEM-7B}"
-DATA_PATH="${DATA_PATH:-$ROOT_DIR/data/mixed_train.json}"
-IMAGE_FOLDER="${IMAGE_FOLDER:-$ROOT_DIR}"
-ECG_FOLDER="${ECG_FOLDER:-$ROOT_DIR}"
-OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/checkpoints/gem-medts-v1}"
+echo "[migration] scripts/finetune_gem_medts.sh now delegates to scripts/gem_pipeline.py finetune"
+echo "[migration] prefer: python scripts/gem_pipeline.py finetune --config configs/pipelines/gem_default.yaml"
 
-ECG_TOWER="${ECG_TOWER:-$ROOT_DIR/ecg_coca/open_clip/checkpoint/cpt_wfep_epoch_20.pt}"
-OPEN_CLIP_CONFIG="${OPEN_CLIP_CONFIG:-coca_ViT-B-32}"
-VISION_TOWER="${VISION_TOWER:-openai/clip-vit-large-patch14-336}"
-DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-$ROOT_DIR/scripts/zero2.json}"
+PIPELINE_CONFIG="${PIPELINE_CONFIG:-configs/pipelines/gem_default.yaml}"
+SET_ARGS=()
 
-for path in "$MODEL_NAME_OR_PATH" "$DATA_PATH" "$IMAGE_FOLDER" "$ECG_FOLDER" "$ECG_TOWER" "$DEEPSPEED_CONFIG"; do
-  if [ ! -e "$path" ]; then
-    echo "Error: required path not found: $path" >&2
-    exit 1
-  fi
-done
+append_set() {
+  local key="$1"
+  local value="$2"
+  SET_ARGS+=("--set" "${key}=${value}")
+}
 
-# If you run out of VRAM, reduce batch size / increase grad accumulation, and
-# consider keeping only: --modules_to_save seg_head
-deepspeed "$ROOT_DIR/llava/train/train_mem.py" \
-  --deepspeed "$DEEPSPEED_CONFIG" \
-  --model_name_or_path "$MODEL_NAME_OR_PATH" \
-  --version llava_v1 \
-  --data_path "$DATA_PATH" \
-  --image_folder "$IMAGE_FOLDER" \
-  --ecg_folder "$ECG_FOLDER" \
-  --ecg_tower "$ECG_TOWER" \
-  --open_clip_config "$OPEN_CLIP_CONFIG" \
-  --vision_tower "$VISION_TOWER" \
-  --mm_projector_type mlp2x_gelu \
-  --mm_vision_select_layer -2 \
-  --mm_use_im_start_end False \
-  --mm_use_im_patch_token False \
-  --image_aspect_ratio ori \
-  --group_by_modality_length False \
-  --bf16 True \
-  --output_dir "$OUTPUT_DIR" \
-  --num_train_epochs 3 \
-  --per_device_train_batch_size 4 \
-  --gradient_accumulation_steps 4 \
-  --learning_rate 2e-4 \
-  --lora_enable True --lora_r 128 --lora_alpha 256 \
-  --modules_to_save embed_tokens lm_head seg_head ecg_projector \
-  --tune_mm_mlp_adapter True \
-  --model_max_length 4096 \
-  --gradient_checkpointing True \
-  --evaluation_strategy "no" \
-  --save_strategy "steps" \
-  --save_steps 5000 \
-  --save_total_limit 2 \
-  --logging_steps 10 \
-  --lr_scheduler_type "cosine" \
-  --warmup_ratio 0.03 \
-  --weight_decay 0.0 \
-  --tf32 True \
-  --lazy_preprocess True \
-  --report_to "none"
+[[ -n "${MODEL_NAME_OR_PATH:-}" ]] && append_set "finetune.model_name_or_path" "${MODEL_NAME_OR_PATH}"
+[[ -n "${DATA_PATH:-}" ]] && append_set "finetune.data_path" "${DATA_PATH}"
+[[ -n "${IMAGE_FOLDER:-}" ]] && append_set "finetune.image_folder" "${IMAGE_FOLDER}"
+[[ -n "${ECG_FOLDER:-}" ]] && append_set "finetune.ecg_folder" "${ECG_FOLDER}"
+[[ -n "${OUTPUT_DIR:-}" ]] && append_set "finetune.output_dir" "${OUTPUT_DIR}"
+[[ -n "${ECG_TOWER:-}" ]] && append_set "finetune.ecg_tower" "${ECG_TOWER}"
+[[ -n "${OPEN_CLIP_CONFIG:-}" ]] && append_set "finetune.open_clip_config" "${OPEN_CLIP_CONFIG}"
+[[ -n "${VISION_TOWER:-}" ]] && append_set "finetune.vision_tower" "${VISION_TOWER}"
+[[ -n "${DEEPSPEED_CONFIG:-}" ]] && append_set "finetune.deepspeed_config" "${DEEPSPEED_CONFIG}"
+
+[[ -n "${NUM_TRAIN_EPOCHS:-}" ]] && append_set "finetune.num_train_epochs" "${NUM_TRAIN_EPOCHS}"
+[[ -n "${PER_DEVICE_TRAIN_BATCH_SIZE:-}" ]] && append_set "finetune.per_device_train_batch_size" "${PER_DEVICE_TRAIN_BATCH_SIZE}"
+[[ -n "${GRADIENT_ACCUMULATION_STEPS:-}" ]] && append_set "finetune.gradient_accumulation_steps" "${GRADIENT_ACCUMULATION_STEPS}"
+[[ -n "${LEARNING_RATE:-}" ]] && append_set "finetune.learning_rate" "${LEARNING_RATE}"
+
+exec python "$ROOT_DIR/scripts/gem_pipeline.py" \
+  finetune \
+  --config "$PIPELINE_CONFIG" \
+  "${SET_ARGS[@]}" \
+  "$@"

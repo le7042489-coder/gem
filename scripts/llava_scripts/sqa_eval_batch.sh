@@ -1,13 +1,18 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-CHUNKS=8
-for IDX in {0..7}; do
-    CUDA_VISIBLE_DEVICES=$IDX python -m llava.eval.model_vqa_science \
-        --model-path liuhaotian/llava-lcs558k-scienceqa-vicuna-13b-v1.3 \
-        --question-file ~/haotian/datasets/ScienceQA/data/scienceqa/llava_test_QCM-LEA.json \
-        --image-folder ~/haotian/datasets/ScienceQA/data/scienceqa/images/test \
-        --answers-file ./test_llava-13b-chunk$CHUNKS_$IDX.jsonl \
-        --num-chunks $CHUNKS \
-        --chunk-idx $IDX \
-        --conv-mode llava_v1 &
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$SCRIPT_DIR"
+while [[ "$REPO_ROOT" != "/" && ! -d "$REPO_ROOT/.git" ]]; do
+  REPO_ROOT="$(dirname "$REPO_ROOT")"
 done
+
+if [[ ! -d "$REPO_ROOT/.git" ]]; then
+  echo "Could not locate repository root from wrapper path" >&2
+  exit 1
+fi
+
+TARGET="$REPO_ROOT/legacy/llava_scripts/sqa_eval_batch.sh"
+
+echo "[DEPRECATED] scripts/llava_scripts compatibility wrappers will be removed in the next major release. Use legacy/llava_scripts directly." >&2
+exec bash "$TARGET" "$@"

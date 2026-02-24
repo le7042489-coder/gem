@@ -1,16 +1,18 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-python -m llava.eval.model_vqa_science \
-    --model-path liuhaotian/llava-v1.5-13b \
-    --question-file ./playground/data/eval/scienceqa/llava_test_CQM-A.json \
-    --image-folder ./playground/data/eval/scienceqa/images/test \
-    --answers-file ./playground/data/eval/scienceqa/answers/llava-v1.5-13b.jsonl \
-    --single-pred-prompt \
-    --temperature 0 \
-    --conv-mode vicuna_v1
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$SCRIPT_DIR"
+while [[ "$REPO_ROOT" != "/" && ! -d "$REPO_ROOT/.git" ]]; do
+  REPO_ROOT="$(dirname "$REPO_ROOT")"
+done
 
-python llava/eval/eval_science_qa.py \
-    --base-dir ./playground/data/eval/scienceqa \
-    --result-file ./playground/data/eval/scienceqa/answers/llava-v1.5-13b.jsonl \
-    --output-file ./playground/data/eval/scienceqa/answers/llava-v1.5-13b_output.jsonl \
-    --output-result ./playground/data/eval/scienceqa/answers/llava-v1.5-13b_result.json
+if [[ ! -d "$REPO_ROOT/.git" ]]; then
+  echo "Could not locate repository root from wrapper path" >&2
+  exit 1
+fi
+
+TARGET="$REPO_ROOT/legacy/llava_scripts/v1_5/eval/sqa.sh"
+
+echo "[DEPRECATED] scripts/llava_scripts compatibility wrappers will be removed in the next major release. Use legacy/llava_scripts directly." >&2
+exec bash "$TARGET" "$@"

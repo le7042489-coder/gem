@@ -1,14 +1,18 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-python -m llava.eval.model_vqa_loader \
-    --model-path liuhaotian/llava-v1.5-13b \
-    --question-file ./playground/data/eval/vizwiz/llava_test.jsonl \
-    --image-folder ./playground/data/eval/vizwiz/test \
-    --answers-file ./playground/data/eval/vizwiz/answers/llava-v1.5-13b.jsonl \
-    --temperature 0 \
-    --conv-mode vicuna_v1
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$SCRIPT_DIR"
+while [[ "$REPO_ROOT" != "/" && ! -d "$REPO_ROOT/.git" ]]; do
+  REPO_ROOT="$(dirname "$REPO_ROOT")"
+done
 
-python scripts/convert_vizwiz_for_submission.py \
-    --annotation-file ./playground/data/eval/vizwiz/llava_test.jsonl \
-    --result-file ./playground/data/eval/vizwiz/answers/llava-v1.5-13b.jsonl \
-    --result-upload-file ./playground/data/eval/vizwiz/answers_upload/llava-v1.5-13b.json
+if [[ ! -d "$REPO_ROOT/.git" ]]; then
+  echo "Could not locate repository root from wrapper path" >&2
+  exit 1
+fi
+
+TARGET="$REPO_ROOT/legacy/llava_scripts/v1_5/eval/vizwiz.sh"
+
+echo "[DEPRECATED] scripts/llava_scripts compatibility wrappers will be removed in the next major release. Use legacy/llava_scripts directly." >&2
+exec bash "$TARGET" "$@"

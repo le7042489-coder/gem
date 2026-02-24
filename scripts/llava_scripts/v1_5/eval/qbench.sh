@@ -1,18 +1,18 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-if [ "$1" = "dev" ]; then
-    echo "Evaluating in 'dev' split."
-elif [ "$1" = "test" ]; then
-    echo "Evaluating in 'test' split."
-else
-    echo "Unknown split, please choose between 'dev' and 'test'."
-    exit 1
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$SCRIPT_DIR"
+while [[ "$REPO_ROOT" != "/" && ! -d "$REPO_ROOT/.git" ]]; do
+  REPO_ROOT="$(dirname "$REPO_ROOT")"
+done
+
+if [[ ! -d "$REPO_ROOT/.git" ]]; then
+  echo "Could not locate repository root from wrapper path" >&2
+  exit 1
 fi
 
-python -m llava.eval.model_vqa_qbench \
-    --model-path liuhaotian/llava-v1.5-13b \
-    --image-folder ./playground/data/eval/qbench/images_llvisionqa/ \
-    --questions-file ./playground/data/eval/qbench/llvisionqa_$1.json \
-    --answers-file ./playground/data/eval/qbench/llvisionqa_$1_answers.jsonl \
-    --conv-mode llava_v1 \
-    --lang en
+TARGET="$REPO_ROOT/legacy/llava_scripts/v1_5/eval/qbench.sh"
+
+echo "[DEPRECATED] scripts/llava_scripts compatibility wrappers will be removed in the next major release. Use legacy/llava_scripts directly." >&2
+exec bash "$TARGET" "$@"

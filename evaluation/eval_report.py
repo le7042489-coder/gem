@@ -1,180 +1,277 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
 import json
 import os
-import json 
-import requests
-# from openai import AzureOpenAI
-import openai
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tenacity import retry, wait_random_exponential, stop_after_attempt
-import json
-from tqdm import tqdm
-import numpy as np
-from prompts import report_eval_prompt
+from pathlib import Path
+from statistics import mean
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-DEFAULT_MODEL = os.getenv("EVAL_MODEL", "gpt-4o-2024-08-06")
+try:  # pragma: no cover - import availability depends on runtime env
+    from openai import OpenAI as _OpenAIClient
+except ModuleNotFoundError:  # pragma: no cover
+    _OpenAIClient = None
+
+try:
+    from .prompts import report_eval_prompt
+except ImportError:  # pragma: no cover
+    from prompts import report_eval_prompt
+
+OpenAI = _OpenAIClient
 
 
-def _ensure_openai_configured():
-    # Configure via environment variables (recommended):
-    # - OpenAI: OPENAI_API_KEY
-    # - Azure OpenAI (if you enable the Azure client below): AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT
-    if not os.getenv("OPENAI_API_KEY") and not os.getenv("AZURE_OPENAI_API_KEY"):
-        raise RuntimeError(
-            "Missing API key: set OPENAI_API_KEY (or AZURE_OPENAI_API_KEY for Azure OpenAI)."
-        )
-    openai.api_key = os.getenv("OPENAI_API_KEY")
+def _load_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
-def load_jsonl(file_path):
-    with open(file_path, 'r') as file:
-        data = [json.loads(line) for line in file]
-    return data
 
-def extract_json_from_text(text):
-    # Find the start and end of the JSON object
-    start = text.find("{")
-    end = text.rfind("}") + 1
-    
-    if start == -1 or end == 0:
-        return None
-    
-    # Extract the JSON string
-    json_str = text[start:end]
-    
+def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
+def _extract_qid(row: Mapping[str, Any]) -> Optional[str]:
+    value = row.get("question_id") or row.get("id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _extract_generated_report(row: Mapping[str, Any]) -> str:
+    value = row.get("text")
+    if isinstance(value, str):
+        return value
+    value = row.get("response")
+    if isinstance(value, str):
+        return value
+    return ""
+
+
+def _extract_ecg_tail(qid: str) -> str:
+    return qid.split("-")[-1]
+
+
+def _extract_json_text(raw: str) -> Optional[Dict[str, Any]]:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+        text = re.sub(r"```$", "", text).strip()
+
     try:
-        # Parse the JSON string
-        json_obj = json.loads(json_str)
-        return json_obj
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
     except json.JSONDecodeError:
-        print("Error: Invalid JSON format")
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end <= start:
         return None
+    block = text[start : end + 1]
+    try:
+        obj = json.loads(block)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        return None
+    return None
 
 
-def process(datum, ptb_golden_report, output_dir, eval_model_name, client):
-    if "question_id" in datum:
-        ecg_id = datum['question_id'].split('-')[-1]
-        generated_report = datum['text']
-    elif "id" in datum:
-        ecg_id = datum['id'].split('-')[-1]
-        generated_report = datum['response']
-        
-    golden_report = ptb_golden_report[ecg_id]
-
-    report_score_prompt = report_eval_prompt
-
-    prompt = f"{report_score_prompt} \n [The Start of Ground Truth Report]\n {golden_report}\n [The End of Ground Truth Report]\n [The Start of Generated Report]\n {generated_report}\n [The End of Generated Report]"
-
-    # response = client.chat.completions.create(
-    #     model=eval_model_name,
-    #     messages=[
-    #         {"role": "user", "content": prompt},
-    #     ],
-    #     temperature=0,
-    #     response_format={"type": "json_object"},
-    # )
-    response = openai.ChatCompletion.create(
-        model=eval_model_name,
-        messages=[
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0,
+def _build_prompt(golden_report: str, generated_report: str) -> str:
+    return (
+        f"{report_eval_prompt}\n"
+        f"[The Start of Ground Truth Report]\n{golden_report}\n[The End of Ground Truth Report]\n"
+        f"[The Start of Generated Report]\n{generated_report}\n[The End of Generated Report]"
     )
 
-    # Save the JSON response directly to a .json file
-    with open(f'{output_dir}/{ecg_id}.json', 'w') as f:
-        f.write(response.choices[0].message.content)
-        
-def run_pairwise_comparison(ptb_test_generated_report_file, ptb_golden_report,  output_dir, eval_model_name, client):
 
-    ptb_test_generated_report = load_jsonl(ptb_test_generated_report_file)
-    # print(ptb_test_generated_report[0])
-
-    existing_files = os.listdir(output_dir)
-    existing_images = [file.split('.')[0] for file in existing_files]
-    if "question_id" in ptb_test_generated_report[0]:
-        filtered_ptb_test_generated_report = [datum for datum in ptb_test_generated_report if datum['question_id'].split('-')[-1] not in existing_images]
-    elif "id" in ptb_test_generated_report[0]:
-        filtered_ptb_test_generated_report = [datum for datum in ptb_test_generated_report if datum['id'].split('-')[-1] not in existing_images]
-    # filtered_ptb_test_generated_report = [datum for datum in ptb_test_generated_report if datum['question_id'].split('-')[-1] not in existing_images]
-    print(len(filtered_ptb_test_generated_report))
-    print(f"eval_model_name: {eval_model_name}")
-
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(process, datum, ptb_golden_report, output_dir, eval_model_name, client) for datum in filtered_ptb_test_generated_report]
-        # Use tqdm to show progress
-        for future in tqdm(as_completed(futures), total=len(futures)):
-            future.result()  # Wait for the result to handle any exceptions that might occur
+def _request_once(client: OpenAI, model: str, prompt: str) -> str:
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+    )
+    content = response.choices[0].message.content
+    return content or ""
 
 
-def compute_score(output_dir):
-    report_scores = {}
-    all_scores = {}
-    for file in os.listdir(output_dir):
-        with open(f"{output_dir}/{file}", 'r',encoding='utf-8') as f:
-            # print(file)
-            # Due to the output may start with ```json
+def _request_with_retry(
+    client: OpenAI,
+    model: str,
+    prompt: str,
+    max_retries: int,
+) -> str:
+    last_error: Optional[Exception] = None
+    for _ in range(max_retries):
+        try:
+            return _request_once(client, model, prompt)
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+    raise RuntimeError(f"OpenAI request failed after {max_retries} retries: {last_error}")
+
+
+def _score_report_object(report_obj: Dict[str, Any]) -> Tuple[float, Dict[str, float]]:
+    dimension_scores: Dict[str, float] = {}
+    for key, value in report_obj.items():
+        if isinstance(value, dict) and "Score" in value:
             try:
-                report_score = json.load(f)
-            except:
-                f.seek(0)
-                content = f.read()
-                content = content.strip()
-                if content.startswith("```"):
-                    first_newline = content.find("\n")
-                    if first_newline != -1:
-                        content = content[first_newline:].strip()
-                    else:
-                        content = ""
-                if content.endswith("```"):
-                    last_backtick_idx = content.rfind("\n```")
-                    if last_backtick_idx != -1:
-                        content = content[:last_backtick_idx].strip()
-                    else:
-                        content = content[:-3].strip()
-                    report_score = json.loads(content)
-            # sum the scores
-            for key, value in report_score.items():
-                if key not in all_scores:
-                    all_scores[key] = []
-                all_scores[key].append(value['Score'])
-            report_scores[file.split('.')[0]] = sum([value['Score'] for key, value in report_score.items()])/len(report_score) * 10
-    
-    for key, value in all_scores.items():
-        print(f"{key}: {np.mean(value)*10}")
-    # print the average scores
-    print(f'Lenght of report_scores: {len(report_scores)}')
-    print(f"Average Score: {np.mean(list(report_scores.values()))}")
+                dimension_scores[key] = float(value["Score"]) * 10.0
+            except (TypeError, ValueError):
+                continue
+    avg = float(mean(dimension_scores.values())) if dimension_scores else 0.0
+    return avg, dimension_scores
 
 
-# main function
-def main():
-    _ensure_openai_configured()
-    # golden report file
-    ptb_golden_report_file = json.load(open('', 'r'))
-    ptb_golden_report = {datum["id"].split("-")[-1]: datum['conversations'][-1]['value'] for datum in ptb_golden_report_file}
+def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate generated ECG reports with OpenAI")
+    parser.add_argument("--predictions-jsonl", required=True, help="Path to generated report JSONL")
+    parser.add_argument("--gold-json", required=True, help="Path to gold report JSON file")
+    parser.add_argument("--output-dir", required=True, help="Directory for per-id JSON and summary")
+    parser.add_argument("--model", default=os.getenv("EVAL_MODEL", "gpt-4o-2024-08-06"))
+    parser.add_argument("--max-workers", type=int, default=8)
+    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
+    parser.add_argument("--resume", action="store_true", help="Skip ids that already have output files")
+    parser.add_argument("--pretty", action="store_true")
+    return parser.parse_args(argv)
 
-    # model generated report file
-    test_model_name = 'step-final'
-    model_name = ""
-    ptb_test_generated_report_file = f'../eval_outputs/{model_name}/ptb-test-report/{test_model_name}.jsonl'
 
-    # report score save directory
-    output_dir = f'../eval_outputs/report_scores/report-{model_name}-{test_model_name}'
-    os.makedirs(output_dir, exist_ok=True)
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = _parse_args(argv)
 
-    # client = AzureOpenAI(
-    #     api_key=os.getenv("AZURE_OPENAI_API_KEY"),  
-    #     api_version="2024-08-01-preview",
-    #     azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-    # )
+    api_key = os.getenv(args.api_key_env, "")
+    if not api_key:
+        raise RuntimeError(f"Missing API key: set {args.api_key_env}")
+    if OpenAI is None:
+        raise RuntimeError("Missing dependency 'openai'. Install it with: pip install openai")
 
-    client = None
-    eval_model_name=DEFAULT_MODEL
+    predictions_path = Path(args.predictions_jsonl).expanduser().resolve()
+    gold_path = Path(args.gold_json).expanduser().resolve()
+    output_dir = Path(args.output_dir).expanduser().resolve()
 
-    print(f"Pairwise Comparison: ecg-chat-{model_name}-{test_model_name}")
-    run_pairwise_comparison(ptb_test_generated_report_file, ptb_golden_report, output_dir, eval_model_name, client)
+    if not predictions_path.exists():
+        raise FileNotFoundError(f"predictions_jsonl not found: {predictions_path}")
+    if not gold_path.exists():
+        raise FileNotFoundError(f"gold_json not found: {gold_path}")
 
-    print(f"ECG Report Score: {output_dir}")
-    compute_score(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-if __name__ == '__main__':
-    main()
+    pred_rows = _load_jsonl(predictions_path)
+    gold_rows = _load_json(gold_path)
+    if not isinstance(gold_rows, list):
+        raise ValueError("gold_json must contain a JSON list")
+
+    gold_report_map: Dict[str, str] = {}
+    for row in gold_rows:
+        if not isinstance(row, dict):
+            continue
+        qid = _extract_qid(row)
+        if not qid:
+            continue
+        tail = _extract_ecg_tail(qid)
+        conversations = row.get("conversations", [])
+        if isinstance(conversations, list) and conversations:
+            last = conversations[-1]
+            if isinstance(last, dict) and isinstance(last.get("value"), str):
+                gold_report_map[tail] = last["value"]
+
+    tasks: List[Tuple[str, str, str]] = []
+    for row in pred_rows:
+        qid = _extract_qid(row)
+        if not qid:
+            continue
+        tail = _extract_ecg_tail(qid)
+        generated = _extract_generated_report(row)
+        golden = gold_report_map.get(tail)
+        if not golden:
+            continue
+        output_file = output_dir / f"{tail}.json"
+        if args.resume and output_file.exists():
+            continue
+        tasks.append((tail, generated, golden))
+
+    client = OpenAI(api_key=api_key)
+
+    def _worker(ecg_id: str, generated: str, golden: str) -> str:
+        prompt = _build_prompt(golden, generated)
+        return _request_with_retry(client, args.model, prompt, args.max_retries)
+
+    futures = {}
+    with ThreadPoolExecutor(max_workers=max(1, int(args.max_workers))) as pool:
+        for ecg_id, generated, golden in tasks:
+            futures[pool.submit(_worker, ecg_id, generated, golden)] = ecg_id
+
+        for future in as_completed(futures):
+            ecg_id = futures[future]
+            raw_text = future.result()
+            payload = {"id": ecg_id, "results": raw_text}
+            with (output_dir / f"{ecg_id}.json").open("w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    per_id_scores: Dict[str, Any] = {}
+    per_dimension: Dict[str, List[float]] = {}
+    for path in sorted(output_dir.glob("*.json")):
+        try:
+            item = _load_json(path)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(item, dict):
+            continue
+        raw_text = item.get("results")
+        ecg_id = str(item.get("id") or path.stem)
+        if not isinstance(raw_text, str):
+            continue
+        parsed = _extract_json_text(raw_text)
+        if not parsed:
+            continue
+
+        avg_score, dims = _score_report_object(parsed)
+        per_id_scores[ecg_id] = {
+            "average_score": avg_score,
+            "dimensions": dims,
+        }
+        for key, value in dims.items():
+            per_dimension.setdefault(key, []).append(value)
+
+    summary = {
+        "model": args.model,
+        "predictions_jsonl": str(predictions_path),
+        "gold_json": str(gold_path),
+        "output_dir": str(output_dir),
+        "num_predictions": len(pred_rows),
+        "num_scored": len(per_id_scores),
+        "average_score": float(
+            mean([item["average_score"] for item in per_id_scores.values()])
+        )
+        if per_id_scores
+        else 0.0,
+        "dimension_means": {
+            key: float(mean(values))
+            for key, values in sorted(per_dimension.items())
+            if values
+        },
+        "per_id_scores": per_id_scores,
+    }
+
+    summary_path = output_dir / "summary.json"
+    with summary_path.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2 if args.pretty else None)
+        if args.pretty:
+            f.write("\n")
+
+    print(json.dumps(summary, ensure_ascii=False, indent=2 if args.pretty else None))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

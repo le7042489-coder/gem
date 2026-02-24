@@ -1,0 +1,37 @@
+datasets:
+  ptb-test:
+    task: multilabel
+    gold_file: data/ecg_bench/ptb-test.json
+    prediction_match: ptb-test
+    exclude_match: [report]
+    label_space: [NORM, MI, STTC, CD, HYP]
+  cpsc-test:
+    task: multilabel
+    gold_file: data/ecg_bench/cpsc-test.json
+    prediction_match: cpsc-test
+    label_space: [NORM, AF, I-AVB, LBBB, RBBB, PAC, PVC, STD, STE]
+  code15-test:
+    task: multilabel
+    gold_file: data/ecg_bench/code15-test.json
+    prediction_match: code15-test
+    label_space: [1dAVb, RBBB, LBBB, SB, ST, AF]
+    include_norm_abnormal: true
+  ecgqa-test:
+    task: option_set
+    gold_file: data/ecg_bench/ecgqa-test.json
+    prediction_match: ecgqa-test
+  mmmu-ecg:
+    task: multichoice
+    gold_file: data/ecg_bench/mmmu-ecg.json
+    prediction_match: mmmu-ecg
+    options: [A, B, C, D, E, F, G, H]
+  csn-test-no-cot:
+    task: multichoice
+    gold_file: data/ecg_bench/csn-test-no-cot.json
+    prediction_match: csn-test
+    options: [A, B, C, D, E, F, G, H]
+  g12-test-no-cot:
+    task: multichoice
+    gold_file: data/ecg_bench/g12-test-no-cot.json
+    prediction_match: g12-test
+    options: [A, B, C, D, E, F, G, H]

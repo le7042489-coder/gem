@@ -1,0 +1,113 @@
+paths:
+  repo_root: "."
+  checkpoints_dir: "checkpoints"
+  data_root: "data"
+  eval_output_root: "eval_outputs"
+  ecg_tower: "ecg_coca/open_clip/checkpoint/cpt_wfep_epoch_20.pt"
+
+train:
+  enabled: true
+  launcher: "torchrun"
+  model_name_or_path: "checkpoints/GEM-7B"
+  data_path: "data/mixed_train.json"
+  image_folder: "."
+  ecg_folder: "."
+  output_dir: "checkpoints/gem-train"
+  deepspeed_config: "scripts/zero2.json"
+  version: "llava_v1"
+  report_to: "none"
+  gpus_per_node: 1
+  nnodes: 1
+  node_rank: 0
+  master_addr: "127.0.0.1"
+  master_port: 1234
+  num_train_epochs: 1
+  grad_acc_step: 2
+  batch_per_gpu: 16
+  dataloader_num_workers: 64
+  save_steps: 0.2
+
+finetune:
+  enabled: true
+  launcher: "deepspeed"
+  model_name_or_path: "checkpoints/GEM-7B"
+  data_path: "data/mixed_train.json"
+  image_folder: "."
+  ecg_folder: "."
+  output_dir: "checkpoints/gem-medts-v1"
+  ecg_tower: "ecg_coca/open_clip/checkpoint/cpt_wfep_epoch_20.pt"
+  open_clip_config: "coca_ViT-B-32"
+  vision_tower: "openai/clip-vit-large-patch14-336"
+  deepspeed_config: "scripts/zero2.json"
+  num_train_epochs: 3
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 0.0002
+
+evaluation:
+  datasets_config: "evaluation/config/datasets.yaml"
+  ecgbench:
+    enabled: true
+    model_path: "checkpoints/GEM-7B"
+    model_base: null
+    split: "ecg-grounding-test-mimiciv"
+    question_file: ""
+    answers_dir: "eval_outputs/gem/ecgbench"
+    answers_file: ""
+    image_folder: ""
+    ecg_folder: ""
+    conv_mode: "llava_v1"
+    open_clip_config: "coca_ViT-B-32"
+    ecg_tower: ""
+    temperature: 0.0
+    top_p: null
+    num_beams: 1
+    max_new_tokens: 1024
+  grounding:
+    enabled: true
+    model_path: "checkpoints/GEM-7B"
+    model_base: null
+    question_files_glob: ""
+    question_files: []
+    answers_dir: "eval_outputs/gem/ecg-grounding-test"
+    image_folder: ""
+    ecg_folder: ""
+    conv_mode: "llava_v1"
+    open_clip_config: "coca_ViT-B-32"
+    ecg_tower: ""
+    gpus: [0]
+    temperature: 0.0
+    top_p: null
+    num_beams: 1
+    max_new_tokens: 1024
+  score_ecgbench:
+    pred_root: "eval_outputs/gem"
+    output_json: "eval_outputs/gem/ecgbench_scores.json"
+    splits: []
+  report_eval:
+    predictions_jsonl: ""
+    gold_json: ""
+    output_dir: "eval_outputs/gem/report_scores"
+    openai_model: "gpt-4o-2024-08-06"
+    max_workers: 8
+    resume: true
+
+grounding:
+  merge:
+    result_jsonl: ""
+    test_file: ""
+    output_json: "eval_outputs/gem/grounding_merged.json"
+  gpt_eval:
+    input_json: ""
+    output_dir: "eval_outputs/gem/grounding_gpt_eval"
+    template_file: "gem_evaluation/prompts_evaluation.txt"
+    openai_model: "gpt-4o-2024-08-06"
+    start: 0
+    end: -1
+  score:
+    input_dir: "eval_outputs/gem/grounding_gpt_eval"
+    output_json: "eval_outputs/gem/grounding_scores.json"
+    per_id_json: "eval_outputs/gem/grounding_scores_per_id.json"
+
+legacy:
+  deprecation_message: "[DEPRECATED] scripts/llava_scripts compatibility wrappers will be removed in the next major release. Use legacy/llava_scripts directly."

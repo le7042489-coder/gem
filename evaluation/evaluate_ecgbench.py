@@ -1,488 +1,440 @@
-import os
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
 import json
 import random
-random.seed(42)
-from sklearn.metrics import accuracy_score
-import numpy as np
-from sklearn.metrics import f1_score, roc_auc_score,hamming_loss
-from sklearn.preprocessing import MultiLabelBinarizer
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from statistics import mean
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-def extract(text):
-    if text in ["A", "B", "C", "D", "E", "F", "G", "H"]:
-        return text
-    for char_dot in ["A.", "B.", "C.", "D.", "E.", "F.", "G.", "H."]:
-        if char_dot in text:
-            return char_dot[0]
-    if "The correct option is " in text:
-        predict_char = text.split("The correct option is ")[-1][0]
-        if predict_char in ["A", "B", "C", "D", "E", "F", "G", "H"]:
-            return predict_char
-        else:
-            return None
-    if "Answer:" in text:
-        answer = text.split("Answer:")[-1].strip()
-        # if answer in ["A", "B", "C", "D", "E", "F", "G", "H"]:
-        #   return answer
-        for char in ["A", "B", "C", "D", "E", "F", "G", "H"]:
-            if char in answer:
-                return char
-        else:
-            return None
+import yaml
+
+
+def _accuracy_score(y_true: List[str], y_pred: List[str]) -> float:
+    if not y_true:
+        return 0.0
+    correct = sum(1 for t, p in zip(y_true, y_pred) if t == p)
+    return float(correct / len(y_true))
+
+
+@dataclass
+class FileScore:
+    file: str
+    step: int
+    matched: int
+    gold_total: int
+    metrics: Dict[str, float]
+
+
+def _load_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
+def _load_dataset_config(path: Path) -> Dict[str, Dict[str, Any]]:
+    obj = _load_yaml(path)
+    datasets = obj.get("datasets")
+    if not isinstance(datasets, dict):
+        raise ValueError(f"Invalid datasets config: missing 'datasets' mapping in {path}")
+    return {str(k): dict(v) for k, v in datasets.items() if isinstance(v, dict)}
+
+
+def _load_yaml(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"YAML root must be mapping: {path}")
+    return data
+
+
+def _extract_qid(row: Mapping[str, Any]) -> Optional[str]:
+    for key in ("question_id", "id"):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _extract_prediction_text(row: Mapping[str, Any]) -> str:
+    for key in ("text", "response"):
+        value = row.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def _find_prediction_files(pred_root: Path, include_match: str, excludes: Sequence[str]) -> List[Path]:
+    files: List[Path] = []
+    for path in pred_root.rglob("*.jsonl"):
+        path_str = str(path)
+        if include_match not in path_str:
+            continue
+        if any(token and token in path_str for token in excludes):
+            continue
+        files.append(path)
+    return sorted(files)
+
+
+def _extract_step_num(path: Path) -> int:
+    stem = path.stem
+    m = re.search(r"step-(\d+|final)", stem)
+    if m:
+        token = m.group(1)
+        return 99999 if token == "final" else int(token)
+
+    m = re.search(r"(\d+)", stem)
+    if m:
+        return int(m.group(1))
+    return -1
+
+
+def _extract_option(text: str, options: Sequence[str]) -> Optional[str]:
+    clean = text.strip()
+    if clean in options:
+        return clean
+
+    for opt in options:
+        if f"{opt}." in clean:
+            return opt
+
+    if "The correct option is " in clean:
+        candidate = clean.split("The correct option is ")[-1].strip()[:1]
+        if candidate in options:
+            return candidate
+
+    if "Answer:" in clean:
+        answer = clean.split("Answer:")[-1]
+        for opt in options:
+            if opt in answer:
+                return opt
+
+    return None
+
+
+def _labels_from_text(text: str, label_space: Sequence[str], include_norm_abnormal: bool = False) -> List[str]:
+    picked = [label for label in label_space if label in text]
+    if include_norm_abnormal:
+        if "NORM" in text and "ABNORMAL" not in text:
+            picked = ["NORM", *picked]
+        elif "ABNORMAL" in text:
+            picked = ["ABNORMAL", *picked]
+    out: List[str] = []
+    seen = set()
+    for item in picked:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _option_candidates_from_prompt(prompt: Any) -> List[str]:
+    if isinstance(prompt, dict):
+        prompt_text = str(prompt.get("prompt", ""))
     else:
-        return None
-    
-def compute_f1_auc(y_pred, y_true):
-    # Binarize labels
+        prompt_text = str(prompt)
+
+    if "Options:" not in prompt_text:
+        return []
+    fragment = prompt_text.split("Options:")[-1]
+    fragment = fragment.replace("Only answer based on the given Options without any explanation.", "")
+    return [item.strip() for item in fragment.split(",") if item.strip()]
+
+
+def _compute_multilabel_metrics(pred: List[List[str]], gold: List[List[str]]) -> Dict[str, float]:
+    try:
+        from sklearn.metrics import f1_score, hamming_loss, roc_auc_score
+        from sklearn.preprocessing import MultiLabelBinarizer
+    except ModuleNotFoundError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "scikit-learn is required for multilabel ECG-Bench scoring. Install scikit-learn first."
+        ) from exc
+
     mlb = MultiLabelBinarizer()
-    y_true_bin = mlb.fit_transform(y_true)
-    y_pred_bin = mlb.transform(y_pred)
-    # print(y_true)
-    # print(y_true_bin)
-    hl = hamming_loss(y_true_bin, y_pred_bin)
-    
-    f1_scores_all = []
-    # Compute the F1 score
-    f1_scores = f1_score(y_true_bin, y_pred_bin, average=None)
-    for idx, cls in enumerate(mlb.classes_):
-        # print(f'F1 score for class {cls}: {f1_scores[idx]}')
-        f1_scores_all.append(f1_scores[idx])
-    
-    # Compute the AUC score
-    auc_scores = []
-    for i in range(y_true_bin.shape[1]):
+    gold_bin = mlb.fit_transform(gold)
+    pred_bin = mlb.transform(pred)
+
+    macro_f1 = float(f1_score(gold_bin, pred_bin, average="macro", zero_division=0))
+    hl = float(hamming_loss(gold_bin, pred_bin))
+
+    auc_values: List[float] = []
+    for i in range(gold_bin.shape[1]):
         try:
-            auc = roc_auc_score(y_true_bin[:, i], y_pred_bin[:, i])
+            auc_values.append(float(roc_auc_score(gold_bin[:, i], pred_bin[:, i])))
         except ValueError:
-            auc = np.nan    # If AUC cannot be calculated, NaN is returned
-        auc_scores.append(auc)
-        # print(f'AUC score for class {mlb.classes_[i]}: {auc}')    
-    # print("f1 all",np.mean(f1_scores_all), "auc all", np.mean(auc_scores))
-    return np.mean(f1_scores_all), np.mean(auc_scores), hl
-    
-def eval_mmmu(dir):
-    print("====mmmu====")
-    with open("", "r", encoding='utf-8') as f:
-        data = json.load(f)
-        answer_dict = {item["No"]: item["conversations"][1]["value"] for item in data}
-    
-    score_dict = {}
-    for root, dirs, files in os.walk(dir):
-        for file in files:
-            if file.endswith(".jsonl"):
-                predict_list = []
-                golden_list = []
-                file_path = os.path.join(root, file)
-                if "mmmu-ecg" not in file_path:
-                    continue
-                
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        item = json.loads(line)
-                        if "question_id" in item:
-                            qid = item["question_id"]
-                        elif "id" in item:
-                            qid = item["id"]
-                        if "text" in item:
-                            predict = extract(item["text"])
-                        elif "response" in item:
-                            predict = extract(item["response"])
-                        if predict is None:
-                            predict = random.choice(["A", "B", "C", "D"])
-                        # print(predict)
-                        golden = answer_dict[qid]
-                        predict_list.append(predict)
-                        golden_list.append(golden)
-                # print(predict_list)
-                if len(predict_list) != 200:
-                    continue
+            continue
+    macro_auc = float(mean(auc_values)) if auc_values else 0.0
 
-                accuracy = accuracy_score(golden_list, predict_list)
-                
-                print(file, f"Accuracy: {accuracy}")
-                if "step" in file:
-                    if file.split("-")[-1].split(".")[0] == "final":
-                        step_num = 99999
-                    else:
-                        step_num = int(file.split("-")[-1].split(".")[0])
-                else:
-                    step_num = file.split("_")[0]
-                # step_num = int(file.split("-")[-1].split(".")[0])
-                score_dict[step_num] = accuracy
-    for step_num in sorted(score_dict):
-        if step_num == 99999:
-            print(f"Model final Accuracy: {score_dict[step_num]:.4f}")
+    return {
+        "macro_f1": macro_f1,
+        "macro_auc": macro_auc,
+        "hamming_loss": hl,
+    }
+
+
+def _evaluate_multichoice(
+    pred_rows: List[Dict[str, Any]],
+    gold_rows: List[Dict[str, Any]],
+    options: Sequence[str],
+    seed: int,
+) -> Tuple[int, int, Dict[str, float]]:
+    rng = random.Random(seed)
+
+    pred_map = {
+        _extract_qid(row): _extract_prediction_text(row)
+        for row in pred_rows
+        if _extract_qid(row) is not None
+    }
+
+    y_true: List[str] = []
+    y_pred: List[str] = []
+
+    for row in gold_rows:
+        qid = _extract_qid(row)
+        if not qid:
+            continue
+        true_value = row.get("conversations", [{}, {"value": ""}])[1].get("value")
+        if not isinstance(true_value, str):
+            continue
+
+        pred_text = pred_map.get(qid, "")
+        pred_option = _extract_option(pred_text, options)
+        if pred_option is None:
+            pred_option = rng.choice(list(options))
+
+        y_true.append(true_value)
+        y_pred.append(pred_option)
+
+    if not y_true:
+        return 0, 0, {"accuracy": 0.0}
+
+    return len(y_true), len(gold_rows), {"accuracy": _accuracy_score(y_true, y_pred)}
+
+
+def _evaluate_multilabel(
+    pred_rows: List[Dict[str, Any]],
+    gold_rows: List[Dict[str, Any]],
+    label_space: Sequence[str],
+    include_norm_abnormal: bool,
+) -> Tuple[int, int, Dict[str, float]]:
+    pred_map = {
+        _extract_qid(row): _extract_prediction_text(row)
+        for row in pred_rows
+        if _extract_qid(row) is not None
+    }
+
+    y_true: List[List[str]] = []
+    y_pred: List[List[str]] = []
+
+    for row in gold_rows:
+        qid = _extract_qid(row)
+        if not qid:
+            continue
+
+        true_value = row.get("conversations", [{}, {"value": ""}])[1].get("value")
+        if not isinstance(true_value, str):
+            continue
+
+        y_true.append(
+            _labels_from_text(
+                true_value,
+                label_space,
+                include_norm_abnormal=include_norm_abnormal,
+            )
+        )
+        y_pred.append(
+            _labels_from_text(
+                pred_map.get(qid, ""),
+                label_space,
+                include_norm_abnormal=include_norm_abnormal,
+            )
+        )
+
+    if not y_true:
+        return 0, 0, {"macro_f1": 0.0, "macro_auc": 0.0, "hamming_loss": 1.0}
+
+    return len(y_true), len(gold_rows), _compute_multilabel_metrics(y_pred, y_true)
+
+
+def _evaluate_option_set(
+    pred_rows: List[Dict[str, Any]],
+    gold_rows: List[Dict[str, Any]],
+) -> Tuple[int, int, Dict[str, float]]:
+    pred_map = {qid: row for row in pred_rows if (qid := _extract_qid(row))}
+
+    matched = 0
+    total = 0
+    for row in gold_rows:
+        qid = _extract_qid(row)
+        if not qid:
+            continue
+
+        true_value = row.get("conversations", [{}, {"value": ""}])[1].get("value")
+        if not isinstance(true_value, str):
+            continue
+
+        pred_row = pred_map.get(qid)
+        pred_text = _extract_prediction_text(pred_row or {})
+        candidates = _option_candidates_from_prompt((pred_row or {}).get("prompt", ""))
+        pred_tokens = [token for token in candidates if token.lower() in pred_text.lower()]
+        pred_joined = "".join(pred_tokens)
+
+        matched += int(set(pred_joined) == set(true_value))
+        total += 1
+
+    accuracy = float(matched / total) if total else 0.0
+    return total, len(gold_rows), {"accuracy": accuracy}
+
+
+def _score_split(
+    split: str,
+    split_cfg: Dict[str, Any],
+    pred_root: Path,
+    seed: int,
+) -> Dict[str, Any]:
+    task = str(split_cfg.get("task", "")).strip()
+    if task not in {"multichoice", "multilabel", "option_set"}:
+        raise ValueError(f"Unsupported task '{task}' for split '{split}'")
+
+    gold_file = Path(str(split_cfg["gold_file"]))
+    if not gold_file.is_absolute():
+        gold_file = (Path.cwd() / gold_file).resolve()
+    if not gold_file.exists():
+        raise FileNotFoundError(f"Gold file not found for split '{split}': {gold_file}")
+
+    gold_rows = _load_json(gold_file)
+    if not isinstance(gold_rows, list):
+        raise ValueError(f"Gold file must contain a JSON list: {gold_file}")
+
+    include_match = str(split_cfg.get("prediction_match") or split)
+    excludes = split_cfg.get("exclude_match") or []
+    pred_files = _find_prediction_files(pred_root, include_match, excludes)
+
+    file_scores: List[FileScore] = []
+    for pred_file in pred_files:
+        pred_rows = _load_jsonl(pred_file)
+
+        if task == "multichoice":
+            options = split_cfg.get("options") or ["A", "B", "C", "D", "E", "F", "G", "H"]
+            matched, gold_total, metrics = _evaluate_multichoice(pred_rows, gold_rows, options, seed)
+        elif task == "multilabel":
+            label_space = split_cfg.get("label_space") or []
+            matched, gold_total, metrics = _evaluate_multilabel(
+                pred_rows,
+                gold_rows,
+                label_space=label_space,
+                include_norm_abnormal=bool(split_cfg.get("include_norm_abnormal", False)),
+            )
         else:
-            print(f"Model {step_num} Accuracy: {score_dict[step_num]:.4f}")
+            matched, gold_total, metrics = _evaluate_option_set(pred_rows, gold_rows)
+
+        file_scores.append(
+            FileScore(
+                file=str(pred_file),
+                step=_extract_step_num(pred_file),
+                matched=matched,
+                gold_total=gold_total,
+                metrics=metrics,
+            )
+        )
+
+    primary_metric = "accuracy" if task in {"multichoice", "option_set"} else "macro_f1"
+    file_scores.sort(key=lambda x: (x.step, x.metrics.get(primary_metric, 0.0)))
+
+    best = max(file_scores, key=lambda x: x.metrics.get(primary_metric, -1.0), default=None)
+
+    payload: Dict[str, Any] = {
+        "task": task,
+        "gold_file": str(gold_file),
+        "gold_count": len(gold_rows),
+        "prediction_files": [
+            {
+                "file": item.file,
+                "step": item.step,
+                "matched": item.matched,
+                "gold_total": item.gold_total,
+                "coverage": float(item.matched / item.gold_total) if item.gold_total else 0.0,
+                "metrics": item.metrics,
+            }
+            for item in file_scores
+        ],
+        "primary_metric": primary_metric,
+    }
+
+    if best is not None:
+        payload["best"] = {
+            "file": best.file,
+            "step": best.step,
+            "metrics": best.metrics,
+        }
+    else:
+        payload["best"] = None
+
+    return payload
 
 
-def eval_ptb_test(dir):
-    print("====ptb test====")
-    label_space = ["NORM","MI","STTC","CD","HYP"]
-    golden_data_path = ""
-    golden_label = {}
-    with open(golden_data_path, "r", encoding='utf-8') as f:
-        golden_data = json.load(f)
-        for item in golden_data:
-            qid = item["id"]
-            golden_label[qid] = [label for label in label_space if label in item["conversations"][1]["value"]]
-        
-    score_dict = {}
-    for root, dirs, files in os.walk(dir):
-        for file in files:
-            if file.endswith(".jsonl"):
-                file_path = os.path.join(root, file)
-                if "ptb-test" not in file_path or "report" in file_path:
-                    continue
-                predict_list = []
-                golden_list = []
-                with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
-                    for line in f:
-                        item = json.loads(line)
-                        if "question_id" in item:
-                            qid = item["question_id"]
-                        elif "id" in item:
-                            qid = item["id"]
-                        if "text" in item:
-                            predict = [label for label in label_space if label in item["text"]]
-                        elif "response" in item:
-                            predict = [label for label in label_space if label in item["response"]]
-                        
-                        true = golden_label[qid]
-                        predict_list.append(predict)
-                        golden_list.append(true)
-                f1, auc, hl = compute_f1_auc(predict_list, golden_list)
-                print(file, "f1", round(f1*100, 1), "auc", round(auc*100, 1), "hl", round(hl*100, 1))
-                
-                if "step" in file:
-                    if file.split("-")[-1].split(".")[0] == "final":
-                        step_num = 99999
-                    else:
-                        step_num = int(file.split("-")[-1].split(".")[0])
-                else:
-                    step_num = file.split("_")[0]
-                # step_num = int(file.split("-")[-1].split(".")[0])
-                score_dict[step_num] = f"F1: {f1:.4f}, AUC: {auc:.4f}"
-    for step_num in sorted(score_dict):
-        if step_num == 99999:
-            print(f"Model final Accuracy: {score_dict[step_num]}")
-        else:
-            print(f"Model {step_num} Accuracy: {score_dict[step_num]}")
+def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate GEM ECG-Bench results")
+    parser.add_argument("--pred-root", required=True, help="Root directory containing prediction JSONL files")
+    parser.add_argument("--datasets-config", required=True, help="Path to evaluation/config/datasets.yaml")
+    parser.add_argument("--splits", nargs="*", default=[], help="Optional subset of split names")
+    parser.add_argument("--output-json", default="", help="Optional output JSON path")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--pretty", action="store_true", help="Pretty print JSON output")
+    return parser.parse_args(argv)
 
 
-                
-def eval_cpsc_test(dir):
-    print("====cpsc test====")
-    label_space = ["NORM", "AF", "I-AVB", "LBBB", "RBBB", "PAC", "PVC", "STD", "STE"]
-    golden_data_path = ""
-    golden_label = {}
-    with open(golden_data_path, "r", encoding='utf-8') as f:
-        golden_data = json.load(f)
-        for item in golden_data:
-            qid = item["id"]
-            golden_label[qid] = [label for label in label_space if label in item["conversations"][1]["value"]]
-    # print(golden_label)
-    score_dict = {}
-    for root, dirs, files in os.walk(dir):
-        for file in files:
-            if file.endswith(".jsonl"):
-                file_path = os.path.join(root, file)
-                if "cpsc-test" not in file_path:
-                    continue
-                predict_list = []
-                golden_list = []
-                # print(file,"=====")
-                with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
-                    for line in f:
-                        item = json.loads(line)
-                        if "question_id" in item:
-                            qid = item["question_id"]
-                        elif "id" in item:
-                            qid = item["id"]
-                        if "text" in item:
-                            predict = [label for label in label_space if label in item["text"]]
-                        elif "response" in item:
-                            predict = [label for label in label_space if label in item["response"]]
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = _parse_args(argv)
 
-                        true = golden_label[qid]
+    pred_root = Path(args.pred_root).expanduser().resolve()
+    datasets_cfg_path = Path(args.datasets_config).expanduser().resolve()
 
-                    
-                        predict_list.append(predict)
-                       
-                        golden_list.append(true)
-                        
-                f1, auc, hl = compute_f1_auc(predict_list, golden_list)
-                print(file, "f1", round(f1*100, 1), "auc", round(auc*100, 1), "hl", round(hl*100, 1))
-                if "step" in file:
-                    if file.split("-")[-1].split(".")[0] == "final":
-                        step_num = 99999
-                    else:
-                        step_num = int(file.split("-")[-1].split(".")[0])
-                else:
-                    step_num = file.split("_")[0]
-                # step_num = int(file.split("-")[-1].split(".")[0])
-                score_dict[step_num] = f"F1: {f1:.4f}, AUC: {auc:.4f}"
-    for step_num in sorted(score_dict):
-        if step_num == 99999:
-            print(f"Model final Accuracy: {score_dict[step_num]}")
-        else:
-            print(f"Model {step_num} Accuracy: {score_dict[step_num]}")
+    if not pred_root.exists():
+        raise FileNotFoundError(f"pred_root not found: {pred_root}")
+    if not datasets_cfg_path.exists():
+        raise FileNotFoundError(f"datasets_config not found: {datasets_cfg_path}")
 
-        
-def eval_ecgqa_test(dir):
-    print("====ecgqa test====")
-    golden_data_path = "" # your path to ecgqa test
-    golden_label = {}
-    with open(golden_data_path, "r", encoding='utf-8') as f:
-        golden_data = json.load(f)
-        for item in golden_data:
-            qid = item["id"]
-            golden_label[qid] = item["conversations"][1]["value"]
-            
-    score_dict = {}
-    for root, dirs, files in os.walk(dir):
-        for file in files:
-            if file.endswith(".jsonl"):
-                file_path = os.path.join(root, file)
-                if "ecgqa-test" not in file_path:
-                    continue
-                
-                pass_list = []
-                with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
-                    for line in f:
-                        item = json.loads(line)
-                        if "question_id" in item:
-                            qid = item["question_id"]
-                        elif "id" in item:
-                            qid = item["id"]
-                        
-                        if "prompt" in item:
-                            if isinstance(item["prompt"], dict):
-                                candidates = [i.strip() for i in item["prompt"]["prompt"].split("Options:")[-1].replace("Only answer based on the given Options without any explanation.","").split(",")]
-                            else:
-                                candidates = [i.strip() for i in item["prompt"].split("Options:")[-1].replace("Only answer based on the given Options without any explanation.","").split(",")]
-                        
-                        if "text" in item:
-                            predict = [i for i in candidates if i.lower() in item["text"].lower()]
-                        elif "response" in item:
-                            predict = [i for i in candidates if i in item["response"].lower()]
-                        if isinstance(predict, list):
-                            predict_str = ''.join(predict)
-                        else:
-                            predict_str = predict
-                        if set(predict_str) == set(golden_label[qid]):
-                            pass_list.append(1)
-                        else:
-                            pass_list.append(0)
-                accuracy = sum(pass_list) / len(pass_list)
-                print(file,"accuracy",accuracy)
-                if "step" in file:
-                    if file.split("-")[-1].split(".")[0] == "final":
-                        step_num = 99999
-                    else:
-                        step_num = int(file.split("-")[-1].split(".")[0])
-                else:
-                    step_num = file.split("_")[0]
-                
-                score_dict[step_num] = accuracy
-    for step_num in sorted(score_dict):
-        if step_num == 99999:
-            print(f"Model final Accuracy: {score_dict[step_num]:.4f}")
-        else:
-            print(f"Model {step_num} Accuracy: {score_dict[step_num]:.4f}")
-                            
-def eval_code15_test(dir):
-    print("====code15 test====")
-    label_space = ["1dAVb", "RBBB", "LBBB", "SB", "ST", "AF"]
-    golden_data_path = ""
-    golden_label = {}
-    with open(golden_data_path, "r", encoding='utf-8') as f:
-        golden_data = json.load(f)
-        for item in golden_data:
-            qid = item["id"]
-            if item["conversations"][1]["value"] == "NORM":
-                golden_label[qid] = ["NORM"]
-            elif item["conversations"][1]["value"] == "ABNORMAL":
-                golden_label[qid] = ["ABNORMAL"]
-            else:
-                golden_label[qid] = [label for label in label_space if label in item["conversations"][1]["value"]]
-        
-    score_dict = {}
-    for root, dirs, files in os.walk(dir):
-        for file in files:
-            if file.endswith(".jsonl"):
-                file_path = os.path.join(root, file)
-                if "code15-test" not in file_path:
-                    continue
-                predict_list = []
-                golden_list = []
-                with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
-                    for line in f:
-                        item = json.loads(line)
-                        if "question_id" in item:
-                            qid = item["question_id"]
-                        elif "id" in item:
-                            qid = item["id"]
-                        if "text" in item:
-                            if "Answer:" in item["text"]:
-                                item["text"] = item["text"].split("Answer:")[-1]
-                            if "NORM" in item["text"] and "ABNORMAL" not in item["text"]:
-                                predict = ["NORM"] + [label for label in label_space if label in item["text"]]
-                            elif "ABNORMAL" in item["text"]:
-                                predict = ["ABNORMAL"] + [label for label in label_space if label in item["text"]]
-                            else:
-                                predict = [label for label in label_space if label in item["text"]]
-                        elif "response" in item:
-                            if "Answer:" in item["response"]:
-                                item["response"] = item["response"].split("Answer:")[-1]
-                            if "NORM" in item["response"] and "ABNORMAL" not in item["response"]:
-                                predict = ["NORM"] + [label for label in label_space if label in item["response"]]
-                            elif "ABNORMAL" in item["response"]:
-                                predict = ["ABNORMAL"] + [label for label in label_space if label in item["response"]]
-                            else:
-                                predict = [label for label in label_space if label in item["response"]]
-                    
-                        true = golden_label[qid]
-                        predict_list.append(predict)
-                        golden_list.append(true)
-                f1, auc, hl = compute_f1_auc(predict_list, golden_list)
-                print(file, "f1", round(f1*100, 1), "auc", round(auc*100, 1), "hl", round(hl*100, 1))
-                if "step" in file:
-                    if file.split("-")[-1].split(".")[0] == "final":
-                        step_num = 99999
-                    else:
-                        step_num = int(file.split("-")[-1].split(".")[0])
-                else:
-                    step_num = file.split("_")[0]
-                # step_num = int(file.split("-")[-1].split(".")[0])
-                score_dict[step_num] = f"F1: {f1:.4f}, AUC: {auc:.4f}"
-    for step_num in sorted(score_dict):
-        if step_num == 99999:
-            print(f"Model final Accuracy: {score_dict[step_num]}")
-        else:
-            print(f"Model {step_num} Accuracy: {score_dict[step_num]}")
+    datasets = _load_dataset_config(datasets_cfg_path)
+    requested_splits = args.splits or sorted(datasets.keys())
 
-        
-def eval_csn_test(dir):
-    print("====csn test====")
-    with open("", "r", encoding='utf-8') as f:
-        data = json.load(f)
-        answer_dict = {item["id"]: item["conversations"][1]["value"][0] for item in data}
-    
-    score_dict = {}
-    for root, dirs, files in os.walk(dir):
-        for file in files:
-            if file.endswith(".jsonl"):
-                file_path = os.path.join(root, file)
-                if "csn-test" not in file_path:
-                    continue
-            
-                predict_list = []
-                golden_list = []
-                with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
-                    for line in f:
-                        item = json.loads(line)
-                        if "question_id" in item:
-                            qid = item["question_id"]
-                        elif "id" in item:
-                            qid = item["id"]
-                        if "text" in item:
-                            predict = extract(item["text"])
-                        elif "response" in item:
-                            predict = extract(item["response"])
-                        if predict is None:
-                            # print(file)
-                            # print(item)
-                            predict = random.choice(["A", "B", "C", "D", "E", "F", "G", "H"])
-                        
-                        golden = answer_dict[qid]
-                        predict_list.append(predict)
-                        golden_list.append(golden)
-                
-                if len(predict_list) != 1611:
-                    continue
+    report: Dict[str, Any] = {
+        "pred_root": str(pred_root),
+        "datasets_config": str(datasets_cfg_path),
+        "splits": {},
+    }
 
-                accuracy = accuracy_score(golden_list, predict_list)
-                print(file, f"Accuracy: {accuracy}")
-                # print(file, f"Accuracy: {accuracy}")
-                if "step" in file:
-                    if file.split("-")[-1].split(".")[0] == "final":
-                        step_num = 99999
-                    else:
-                        step_num = int(file.split("-")[-1].split(".")[0])
-                else:
-                    step_num = file.split("_")[0]
-                # step_num = int(file.split("-")[-1].split(".")[0])
-                score_dict[step_num] = accuracy
-    for step_num in sorted(score_dict):
-        if step_num == 99999:
-            print(f"Model final Accuracy: {score_dict[step_num]:.4f}")
-        else:
-            print(f"Model {step_num} Accuracy: {score_dict[step_num]:.4f}")
+    for split in requested_splits:
+        if split not in datasets:
+            raise KeyError(f"Split '{split}' not found in datasets config")
+        report["splits"][split] = _score_split(split, datasets[split], pred_root, seed=args.seed)
 
-        
-def eval_g12_test(dir):
-    print("====g12 test====")
-    with open("", "r", encoding='utf-8') as f:
-        data = json.load(f)
-        answer_dict = {item["id"]: item["conversations"][1]["value"][0] for item in data}
-    
-    score_dict = {}
-    for root, dirs, files in os.walk(dir):
-        for file in files:
-            if file.endswith(".jsonl"):
-                file_path = os.path.join(root, file)
-                if "g12-test" not in file_path:
-                    continue
-                predict_list = []
-                golden_list = []
-                with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
-                    for line in f:
-                        item = json.loads(line)
-                        if "question_id" in item:
-                            qid = item["question_id"]
-                        elif "id" in item:
-                            qid = item["id"]
-                        if "text" in item:
-                            predict = extract(item["text"])
-                        elif "response" in item:
-                            predict = extract(item["response"])
-                        if predict is None:
-                            
-                            predict = random.choice(["A", "B", "C", "D", "E", "F", "G", "H"])
-                        
-                        golden = answer_dict[qid]
-                        predict_list.append(predict)
-                        golden_list.append(golden)
-                
-                if len(predict_list) != 2026:
-                    continue
+    json_text = json.dumps(report, indent=2 if args.pretty else None, ensure_ascii=False)
+    print(json_text)
 
-                accuracy = accuracy_score(golden_list, predict_list)
-                print(file, f"Accuracy: {accuracy}")
-                # print(file, f"Accuracy: {accuracy}")
-                if "step" in file:
-                    if file.split("-")[-1].split(".")[0] == "final":
-                        step_num = 99999
-                    else:
-                        step_num = int(file.split("-")[-1].split(".")[0])
-                else:
-                    step_num = file.split("_")[0]
-                # step_num = int(file.split("-")[-1].split(".")[0])
-                score_dict[step_num] = accuracy
-    for step_num in sorted(score_dict):
-        if step_num == 99999:
-            print(f"Model final Accuracy: {score_dict[step_num]:.4f}")
-        else:
-            print(f"Model {step_num} Accuracy: {score_dict[step_num]:.4f}")
+    if args.output_json:
+        output_path = Path(args.output_json).expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as f:
+            f.write(json_text)
+            if args.pretty:
+                f.write("\n")
 
-            
-                            
+    return 0
+
+
 if __name__ == "__main__":
-    root = ""
-    
-    eval_ptb_test(f"{root}/ptb-test")
-    eval_cpsc_test(f"{root}/cpsc-test")
-    eval_csn_test(f"{root}/csn-test-no-cot")
-    eval_g12_test(f"{root}/g12-test-no-cot")
-    eval_code15_test(f"{root}/code15-test")
-    eval_ecgqa_test(f"{root}/ecgqa-test")
+    raise SystemExit(main())

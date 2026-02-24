@@ -1,23 +1,18 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-python -m llava.eval.model_vqa \
-    --model-path liuhaotian/llava-v1.5-13b \
-    --question-file ./playground/data/eval/llava-bench-in-the-wild/questions.jsonl \
-    --image-folder ./playground/data/eval/llava-bench-in-the-wild/images \
-    --answers-file ./playground/data/eval/llava-bench-in-the-wild/answers/llava-v1.5-13b.jsonl \
-    --temperature 0 \
-    --conv-mode vicuna_v1
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$SCRIPT_DIR"
+while [[ "$REPO_ROOT" != "/" && ! -d "$REPO_ROOT/.git" ]]; do
+  REPO_ROOT="$(dirname "$REPO_ROOT")"
+done
 
-mkdir -p playground/data/eval/llava-bench-in-the-wild/reviews
+if [[ ! -d "$REPO_ROOT/.git" ]]; then
+  echo "Could not locate repository root from wrapper path" >&2
+  exit 1
+fi
 
-python llava/eval/eval_gpt_review_bench.py \
-    --question playground/data/eval/llava-bench-in-the-wild/questions.jsonl \
-    --context playground/data/eval/llava-bench-in-the-wild/context.jsonl \
-    --rule llava/eval/table/rule.json \
-    --answer-list \
-        playground/data/eval/llava-bench-in-the-wild/answers_gpt4.jsonl \
-        playground/data/eval/llava-bench-in-the-wild/answers/llava-v1.5-13b.jsonl \
-    --output \
-        playground/data/eval/llava-bench-in-the-wild/reviews/llava-v1.5-13b.jsonl
+TARGET="$REPO_ROOT/legacy/llava_scripts/v1_5/eval/llavabench.sh"
 
-python llava/eval/summarize_gpt_review.py -f playground/data/eval/llava-bench-in-the-wild/reviews/llava-v1.5-13b.jsonl
+echo "[DEPRECATED] scripts/llava_scripts compatibility wrappers will be removed in the next major release. Use legacy/llava_scripts directly." >&2
+exec bash "$TARGET" "$@"

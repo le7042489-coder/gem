@@ -1,18 +1,18 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-CHUNKS=8
-output_file="test_llava-13b.jsonl"
-
-# Clear out the output file if it exists.
-> "$output_file"
-
-# Loop through the indices and concatenate each file.
-for idx in $(seq 0 $((CHUNKS-1))); do
-  cat "./test_llava-13b-chunk${idx}.jsonl" >> "$output_file"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$SCRIPT_DIR"
+while [[ "$REPO_ROOT" != "/" && ! -d "$REPO_ROOT/.git" ]]; do
+  REPO_ROOT="$(dirname "$REPO_ROOT")"
 done
 
-python llava/eval/eval_science_qa.py \
-    --base-dir ~/haotian/datasets/ScienceQA/data/scienceqa \
-    --result-file ./test_llava-13b.jsonl \
-    --output-file ./test_llava-13b_output.json \
-    --output-result ./test_llava-13b_result.json
+if [[ ! -d "$REPO_ROOT/.git" ]]; then
+  echo "Could not locate repository root from wrapper path" >&2
+  exit 1
+fi
+
+TARGET="$REPO_ROOT/legacy/llava_scripts/sqa_eval_gather.sh"
+
+echo "[DEPRECATED] scripts/llava_scripts compatibility wrappers will be removed in the next major release. Use legacy/llava_scripts directly." >&2
+exec bash "$TARGET" "$@"

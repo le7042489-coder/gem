@@ -1,16 +1,18 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Step 0: Clean up
-rm -rf dist
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$SCRIPT_DIR"
+while [[ "$REPO_ROOT" != "/" && ! -d "$REPO_ROOT/.git" ]]; do
+  REPO_ROOT="$(dirname "$REPO_ROOT")"
+done
 
-# Step 1: Change the package name to "llava-torch"
-sed -i 's/name = "llava"/name = "llava-torch"/' pyproject.toml
+if [[ ! -d "$REPO_ROOT/.git" ]]; then
+  echo "Could not locate repository root from wrapper path" >&2
+  exit 1
+fi
 
-# Step 2: Build the package
-python -m build
+TARGET="$REPO_ROOT/legacy/llava_scripts/upload_pypi.sh"
 
-# Step 3: Revert the changes in pyproject.toml to the original
-sed -i 's/name = "llava-torch"/name = "llava"/' pyproject.toml
-
-# Step 4: Upload to PyPI
-python -m twine upload dist/*
+echo "[DEPRECATED] scripts/llava_scripts compatibility wrappers will be removed in the next major release. Use legacy/llava_scripts directly." >&2
+exec bash "$TARGET" "$@"

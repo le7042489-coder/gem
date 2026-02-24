@@ -1,18 +1,25 @@
-import os
-import json
-import argparse
+#!/usr/bin/env python3
+from __future__ import annotations
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--src", type=str)
-parser.add_argument("--dst", type=str)
-args = parser.parse_args()
+import subprocess
+import sys
+from pathlib import Path
 
-all_answers = []
-for line_idx, line in enumerate(open(args.src)):
-    res = json.loads(line)
-    question_id = res['question_id']
-    text = res['text'].rstrip('.').lower()
-    all_answers.append({"questionId": question_id, "prediction": text})
+HERE = Path(__file__).resolve()
+REPO_ROOT = None
+for parent in [HERE.parent, *HERE.parents]:
+    if (parent / ".git").exists():
+        REPO_ROOT = parent
+        break
 
-with open(args.dst, 'w') as f:
-    json.dump(all_answers, f)
+if REPO_ROOT is None:
+    raise SystemExit("Could not locate repository root from wrapper path")
+
+TARGET = REPO_ROOT / "legacy" / "llava_scripts" / "convert_gqa_for_eval.py"
+
+print(
+    "[DEPRECATED] scripts/llava_scripts compatibility wrappers will be removed in the next major release. Use legacy/llava_scripts directly.",
+    file=sys.stderr,
+)
+
+raise SystemExit(subprocess.call([sys.executable, str(TARGET), *sys.argv[1:]]))

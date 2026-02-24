@@ -1,27 +1,25 @@
-import os
-import json
-import argparse
-import pandas as pd
+#!/usr/bin/env python3
+from __future__ import annotations
 
-def get_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--annotation-file", type=str, required=True)
-    parser.add_argument("--result-dir", type=str, required=True)
-    parser.add_argument("--upload-dir", type=str, required=True)
-    parser.add_argument("--experiment", type=str, required=True)
+import subprocess
+import sys
+from pathlib import Path
 
-    return parser.parse_args()
+HERE = Path(__file__).resolve()
+REPO_ROOT = None
+for parent in [HERE.parent, *HERE.parents]:
+    if (parent / ".git").exists():
+        REPO_ROOT = parent
+        break
 
-if __name__ == "__main__":
-    args = get_args()
+if REPO_ROOT is None:
+    raise SystemExit("Could not locate repository root from wrapper path")
 
-    df = pd.read_table(args.annotation_file)
+TARGET = REPO_ROOT / "legacy" / "llava_scripts" / "convert_mmbench_for_submission.py"
 
-    cur_df = df.copy()
-    cur_df = cur_df.drop(columns=['hint', 'category', 'source', 'image', 'comment', 'l2-category'])
-    cur_df.insert(6, 'prediction', None)
-    for pred in open(os.path.join(args.result_dir, f"{args.experiment}.jsonl")):
-        pred = json.loads(pred)
-        cur_df.loc[df['index'] == pred['question_id'], 'prediction'] = pred['text']
+print(
+    "[DEPRECATED] scripts/llava_scripts compatibility wrappers will be removed in the next major release. Use legacy/llava_scripts directly.",
+    file=sys.stderr,
+)
 
-    cur_df.to_excel(os.path.join(args.upload_dir, f"{args.experiment}.xlsx"), index=False, engine='openpyxl')
+raise SystemExit(subprocess.call([sys.executable, str(TARGET), *sys.argv[1:]]))
