@@ -106,7 +106,7 @@ class LlavaMetaModel:
                 ecg_tower = self.ecg_tower[0]
             else:
                 ecg_tower = self.ecg_tower
-            ecg_tower.load_model()
+            ecg_tower.load_model(model_name=getattr(model_args, 'open_clip_config', 'coca_ViT-B-32'))
         
         self.config.open_clip_config = model_args.open_clip_config
         self.config.use_mm_proj = True

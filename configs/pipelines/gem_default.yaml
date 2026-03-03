@@ -40,9 +40,12 @@ finetune:
   vision_tower: "openai/clip-vit-large-patch14-336"
   deepspeed_config: "scripts/zero2.json"
   num_train_epochs: 3
-  per_device_train_batch_size: 4
-  gradient_accumulation_steps: 4
   learning_rate: 0.0002
+  per_device_train_batch_size: 16
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: false
+  dataloader_num_workers: 12
+  dataloader_prefetch_factor: 2
 
 evaluation:
   datasets_config: "evaluation/config/datasets.yaml"

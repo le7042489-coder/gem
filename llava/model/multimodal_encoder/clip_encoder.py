@@ -42,7 +42,7 @@ class CLIPECGTower(nn.Module):
 
     def load_model(self, model_name, device_map=None):
         if self.ecg_tower_is_loaded:
-            print('{} is already loaded, `load_model` called again, skipping.'.format(self.vision_tower_name))
+            print('{} is already loaded, `load_model` called again, skipping.'.format(self.ecg_tower_name))
             return
 
         self.ecg_tower, self.ecg_processor, self.model_config = get_ecg_encoder(model_name, checkpoint_path=self.ecg_tower_name, device='cpu')

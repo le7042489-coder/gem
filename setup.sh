@@ -102,7 +102,7 @@ else
     fi
 fi
 
-ACTIVE_PYTHON_MM="$(python -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")')"
+ACTIVE_PYTHON_MM="$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
 if [[ "$ACTIVE_PYTHON_MM" != "$PYTHON_VERSION" ]]; then
     warn "Active Python is ${ACTIVE_PYTHON_MM}, expected ${PYTHON_VERSION}."
 fi
